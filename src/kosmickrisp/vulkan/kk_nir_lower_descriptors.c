@@ -821,8 +821,18 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return lower_sysval_to_per_draw(b, intrin, vertex_params);
    case nir_intrinsic_load_tess_param_buffer_poly:
       return lower_sysval_to_per_draw(b, intrin, tess_params);
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      return lower_sysval_to_per_draw(b, intrin, geometry_params);
    case nir_intrinsic_load_index_size_poly:
       return lower_sysval_to_per_draw(b, intrin, index_size);
+   case nir_intrinsic_load_provoking_last:
+      /* Runtime per-draw value: 0 = FIRST, 1 = LAST. Populated from
+       * dyn->rs.provoking_vertex in kk_upload_per_draw_data() (see
+       * kk_cmd_draw.c), same source of truth as non-GS draws'
+       * data->flatshade_first. Not a compile-time constant:
+       * provokingVertexModePerPipeline is advertised true, so different
+       * pipeline binds within one command buffer may use different modes. */
+      return lower_sysval_to_per_draw(b, intrin, provoking_last);
    case nir_intrinsic_load_first_vertex:
       /* Lower only compute shaders */
       if (*(bool *)data) {

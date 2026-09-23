@@ -13,11 +13,19 @@
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
+#include "poly/nir/poly_nir.h"
+
 #include "vk_pipeline_cache.h"
 
 #include "vk_shader.h"
 
 struct kk_cmd_buffer;
+
+/* Synthetic slot in kk_shader::msl_data[] holding the GS-main compute
+ * variant's MSL. The real MESA_SHADER_GEOMETRY slot holds the rast/copy
+ * hardware vertex-function variant instead (see poly_nir_lower_gs()).
+ */
+#define KK_GS_MAIN_SLOT MESA_SHADER_STAGES
 
 struct kk_tess_info {
    enum tess_primitive_mode mode : 8;
@@ -104,6 +112,17 @@ struct kk_shader_info {
       struct {
          struct mtl_size local_size;
       } cs;
+
+      /* Geometry shader main (compute) variant. The rast/copy variant is a
+       * plain hardware vertex shader and does not need its own info here. */
+      struct {
+         struct poly_gs_info info;
+         /* GS shader's declared output primitive class, captured before
+          * poly_nir_lower_gs()/the GS-main compute rewrite overwrite
+          * nir->info.gs (a sibling union member of nir->info.cs). Used to
+          * pick the Metal primitive type for the rast/copy draw. */
+         enum mesa_prim output_primitive;
+      } gs;
    };
 };
 
@@ -131,7 +150,8 @@ struct kk_shader {
 
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
-   struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+   /* +1 for KK_GS_MAIN_SLOT. */
+   struct msl_compile_data msl_data[MESA_SHADER_STAGES + 1];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,

@@ -76,6 +76,14 @@ struct kk_descriptor_state {
 struct kk_per_draw_data {
    uint32_t draw_id;
    uint32_t index_size;
+
+   /* Effective Vulkan provoking-vertex mode for this draw: 0 = FIRST,
+    * 1 = LAST. Consumed by nir_intrinsic_load_provoking_last (lowered in
+    * kk_nir_lower_descriptors.c and, for gs_rast, in kk_shader.c's
+    * targeted post-generation pass). Only meaningful when a geometry
+    * shader is bound; see kk_upload_per_draw_data(). */
+   uint32_t provoking_last;
+
    /* Mask of outputs flowing VS->TCS, VS->GS, or TES->GS . */
    uint64_t vertex_outputs;
 
@@ -84,6 +92,9 @@ struct kk_per_draw_data {
 
    /* Address of tessellation param buffer if tessellation used, else 0 */
    uint64_t tess_params;
+
+   /* Address of geometry param buffer if a geometry shader is used, else 0 */
+   uint64_t geometry_params;
 
    uint64_t base_vertex_addr;
    uint64_t base_instance_addr;
@@ -180,6 +191,16 @@ struct kk_graphics_state {
       struct kk_tess_info info;
       enum mesa_prim prim;
    } tess;
+
+   /* Geometry shader emulation state (milestone-1 direct-draw-only). */
+   struct {
+      /* GPU address of the generated output index buffer for
+       * POLY_GS_SHAPE_DYNAMIC_INDEXED, allocated and filled in by
+       * kk_upload_geometry_params() before GS-main dispatch, consumed by
+       * kk_launch_gs() to rewrite the final raster draw. Zero/unused for
+       * every other GS shape. */
+      uint64_t generated_index_buffer_addr;
+   } gs;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
