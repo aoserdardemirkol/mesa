@@ -256,6 +256,15 @@ kk_get_device_features(
       .shaderStorageImageWriteWithoutFormat = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderUniformBufferArrayDynamicIndexing = true,
+      /* EXPERIMENTAL / VIMA VALIDATION ONLY: the milestone-1 GS
+       * implementation (see the preceding commits) has passed its
+       * dedicated test suite but has not gone through CTS and does not
+       * yet cover XFB, queries, indirect draws, multistream,
+       * tess+GS, or POLY_GS_SHAPE_STATIC_INDEXED. Advertising this
+       * unconditionally is not production-ready -- it exists so VIMA-side
+       * real-workload validation can exercise the feature. Must not ship
+       * as a permanent capability claim without further validation. */
+      .geometryShader = true,
       .tessellationShader = true,
       .textureCompressionASTC_LDR = true,
       .textureCompressionBC = true,
