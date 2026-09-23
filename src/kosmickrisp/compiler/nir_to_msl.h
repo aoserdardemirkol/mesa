@@ -129,6 +129,15 @@ static const nir_shader_compiler_options kk_nir_options = {
    .lower_uadd_carry = true,
    .lower_usub_borrow = true,
    .compact_arrays = true,
+   /* Bound loop unrolling so nir_opt_loop_unroll() can actually unroll
+    * compile-time-bounded loops (it was previously a no-op for every KK
+    * shader, since this option defaults to 0/unset). 32 matches the
+    * near-universal Mesa driver convention, including agx_compile.h, the
+    * sibling driver this GS emulation code is shared from. GS static-
+    * topology detection (poly_nir_lower_gs()) depends on the GS main loop
+    * being unrolled first; without it, even a trivial compile-time-bounded
+    * EmitVertex loop looks "dynamic". */
+   .max_unroll_iterations = 32,
    /* Metal does not support double. */
    .lower_doubles_options = (nir_lower_doubles_options)(~0),
    .lower_int64_options = nir_lower_ufind_msb64 | nir_lower_subgroup_shuffle64,
