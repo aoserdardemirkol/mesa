@@ -1255,6 +1255,49 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
    memcpy(out, &args, sizeof(args));
 }
 
+/* Milestone-1 direct-draw-only geometry shader emulation: no count shader, no
+ * XFB, no queries, no indirect draw. Vertex/primitive counts are known on the
+ * CPU, so all the count/prefix-sum/xfb fields of poly_geometry_params stay
+ * zero-initialized (poly_geometry_params_init() zero-inits the struct).
+ *
+ * POLY_GS_SHAPE_DYNAMIC_INDEXED is the exception: GS-main itself writes the
+ * generated uint32 index buffer (poly_nir_lower_gs()'s lower_gs_instr()
+ * lowers emit_primitive_poly/set_vertex_and_primitive_count to
+ * poly_write_strip()/poly_pad_index_gs() against
+ * load_geometry_param(output_index_buffer)), so the buffer must exist and
+ * args.output_index_buffer must be set *before* this struct is uploaded,
+ * since GS-main's dispatch (kk_launch_gs()) reads the uploaded copy. This
+ * mirrors HoneyKrisp's direct-draw path in hk_cmd_draw.c, which allocates
+ * the same buffer CPU-side ahead of the GS dispatch for the same shape. */
+static void
+kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+                          struct poly_geometry_params *out,
+                          const struct kk_draw_data *draw, enum mesa_prim prim)
+{
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   const uint32_t wg_size[3] = {64, 1, 1};
+
+   struct poly_geometry_params args;
+   poly_geometry_params_init(&args, prim, wg_size);
+   poly_geometry_params_set_draw(&args, prim, gs->info.gs.info.shape,
+                                 gs->info.gs.info.max_indices,
+                                 draw->grid.size.x, draw->grid.size.y);
+
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   gfx->gs.generated_index_buffer_addr = 0u;
+
+   if (gs->info.gs.info.shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      uint32_t index_bytes = args.draw.index_count * (uint32_t)sizeof(uint32_t);
+      struct kk_ptr index_ptr =
+         kk_pool_alloc(cmd, index_bytes, (uint32_t)sizeof(uint32_t));
+
+      args.output_index_buffer = index_ptr.gpu;
+      gfx->gs.generated_index_buffer_addr = index_ptr.gpu;
+   }
+
+   memcpy(out, &args, sizeof(args));
+}
+
 static void
 kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
 {
@@ -1634,6 +1677,12 @@ build_per_draw_upload_mask(struct kk_cmd_buffer *cmd)
       mask |= BITFIELD_BIT(MESA_SHADER_TESS_EVAL);
    }
 
+   /* Geometry shaders will always require per draw data to be submitted. */
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   if (gs) {
+      mask |= BITFIELD_BIT(MESA_SHADER_GEOMETRY);
+   }
+
    struct kk_shader *fragment = cmd->state.shaders[MESA_SHADER_FRAGMENT];
    if (fragment && fragment->info.uses_per_draw_data) {
       mask |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
@@ -1822,6 +1871,16 @@ static bool
 requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
                           struct kk_draw_command *data)
 {
+   /* When a geometry shader is bound, provoking-vertex correction for flat
+    * shading is already handled natively by GS software input assembly /
+    * gs_rast via load_provoking_last (see vertex_id_for_topology_class() in
+    * poly_nir_lower_gs.c). Pre-GS index-buffer unrolling here would rewrite
+    * the application's vertex/topology stream before GS ever sees it,
+    * corrupting GS-visible semantics (gl_in[] order, topology, primitive
+    * count) for a correction GS already performs itself downstream. */
+   if (cmd->state.shaders[MESA_SHADER_GEOMETRY])
+      return false;
+
    struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
 
    /* If the last vertex is provoking and the fragment shader uses flat inputs,
@@ -1903,6 +1962,30 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
       gfx->per_draw_data.tess_params = tess_args.gpu;
       if (tess_args.gpu) {
          kk_upload_tess_params(cmd, tess_args.cpu, draw);
+      }
+   }
+
+   /* Prepare emulation data for the geometry shader (milestone-1: direct
+    * draw only, non-indexed static shape). */
+   bool gs = upload_mask & BITFIELD_BIT(MESA_SHADER_GEOMETRY);
+   if (gs) {
+      struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+      enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
+
+      gfx->per_draw_data.index_size = draw->index.el_size_B;
+      gfx->per_draw_data.base_vertex_addr = upload_base_vertex(cmd, draw);
+      gfx->per_draw_data.base_instance_addr = upload_base_instance(cmd, draw);
+      gfx->per_draw_data.vertex_params = kk_upload_vertex_params(cmd, draw);
+      /* Same source of truth as data->flatshade_first (see kk_draw()):
+       * dyn->rs.provoking_vertex. Read fresh here rather than threaded in,
+       * since kk_upload_per_draw_data() doesn't receive kk_draw_command. */
+      gfx->per_draw_data.provoking_last =
+         dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+      struct kk_ptr gs_args =
+         kk_pool_alloc(cmd, sizeof(struct poly_geometry_params), 4);
+      gfx->per_draw_data.geometry_params = gs_args.gpu;
+      if (gs_args.gpu) {
+         kk_upload_geometry_params(cmd, gs_args.cpu, draw, prim);
       }
    }
 
@@ -2016,16 +2099,181 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
    return draw;
 }
 
+/* Milestone-1 direct-draw-only geometry shader emulation. Dispatches
+ * VS-before-GS then GS-main as compute, then rewrites `draw` into the final
+ * non-indexed rast/copy draw (gs_rast, compiled as a hardware vertex
+ * function into vs->msl_data[MESA_SHADER_GEOMETRY], is bound as the render
+ * pipeline's vertex stage by kk_compile_graphics_pipeline() already). Static,
+ * non-indexed shapes only (asserted at compile time in kk_compile_shader()),
+ * so the final vertex/instance counts are CPU-computable here, matching
+ * kk_upload_geometry_params(). */
+static struct kk_draw_data
+kk_launch_gs(struct kk_cmd_buffer *cmd, struct kk_draw_data draw,
+            enum mesa_prim prim, bool flatshade_first)
+{
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   struct poly_gs_info info = gs->info.gs.info;
+
+   struct kk_grid grid_vs = kk_grid_2d(draw.grid.size.x, draw.grid.size.y);
+   uint32_t prims_per_instance =
+      u_decomposed_prims_for_vertices(prim, draw.grid.size.x);
+   struct kk_grid grid_gs = kk_grid_2d(prims_per_instance, draw.grid.size.y);
+
+   mtl_compute_encoder *enc = cs_get_compute(cmd);
+   struct mtl_size local_size = {64, 1, 1};
+
+   /* VS-before-GS */
+   {
+      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
+      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                       MTL_STAGE_DISPATCH);
+      mtl_compute_set_pipeline_state(enc, pipeline);
+      kk_dispatch_compute(enc, grid_vs, local_size);
+   }
+   /* GS-main */
+   {
+      mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[1];
+      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                       MTL_STAGE_DISPATCH);
+      mtl_compute_set_pipeline_state(enc, pipeline);
+      kk_dispatch_compute(enc, grid_gs, local_size);
+   }
+
+   /* CPU-computed non-indexed rast counts, mirroring
+    * kk_upload_geometry_params()'s poly_geometry_params_set_draw() call. */
+   struct poly_geometry_params params;
+   const uint32_t wg_size[3] = {64, 1, 1};
+   poly_geometry_params_init(&params, prim, wg_size);
+   poly_geometry_params_set_draw(&params, prim, info.shape, info.max_indices,
+                                 draw.grid.size.x, draw.grid.size.y);
+
+   /* grid.size.z is base_instance for the non-indexed render path (see
+    * build_draw_data()'s direct branch); firstInstance is not threaded
+    * through GS emulation in milestone-1, so it is always 0 here. */
+   draw.grid = kk_grid_3d(params.draw.index_count, params.draw.instance_count,
+                          0u);
+   draw.vertex_offset = 0u;
+   draw.primitive_type = mesa_prim_to_mtl_primitive_type(info.mode);
+
+   if (info.shape == POLY_GS_SHAPE_STATIC_INDEXED) {
+      /* Not implemented. poly_nir_lower_gs()'s static-topology fallback
+       * (optimize_static_topology()) reaches this shape for any static GS
+       * topology that needs primitive-restart between differently-shaped
+       * emitted primitives -- i.e. essentially any realistic non-list,
+       * non-strip static topology. Its restart sentinel does not currently
+       * have a representation this draw-time path can consume (see
+       * poly_gs_info::topology, 1 byte per index). Fail loudly rather than
+       * emit wrong indices; do not silently fall back to incorrect
+       * rendering. */
+      UNREACHABLE("KK GS milestone-1 does not implement "
+                  "POLY_GS_SHAPE_STATIC_INDEXED");
+   } else if (info.shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      /* GS-main already wrote the generated uint32 index buffer directly
+       * (poly_write_strip()/poly_pad_index_gs(), lowered into GS-main's own
+       * NIR by poly_nir_lower_gs() for this shape) into the buffer
+       * allocated by kk_upload_geometry_params(), before this dispatch
+       * ran. Just point the final raster draw at it; no separate
+       * count/prefix-sum/pre_gs/indirect-draw step is needed for a direct
+       * draw with no XFB/queries. */
+      uint64_t index_addr = cmd->state.gfx.gs.generated_index_buffer_addr;
+      uint32_t index_bytes =
+         params.draw.index_count * (uint32_t)sizeof(uint32_t);
+
+      draw.index.gpu.addr = index_addr;
+      draw.index.gpu.range = index_bytes;
+      draw.index.el_size_B = (uint32_t)sizeof(uint32_t);
+
+      /* Metal's rasterizer has no native LAST-provoking-vertex mode. The
+       * pre-GS flatshade unroll (requires_unroll_flatshade()) is gated off
+       * when a GS is bound (see that function) because it would rewrite
+       * the application's input stream before GS ever sees it, corrupting
+       * gl_in[]/topology/primitive-id semantics. GS's own
+       * load_provoking_last (vertex_id_for_topology_class(), used only in
+       * lower_gs_inputs()) corrects GS's INPUT assembly only -- it does not
+       * reorder GS's raster OUTPUT. So for LAST-provoking + flat fragment
+       * inputs we reuse the existing libkk_unroll_geometry kernel here,
+       * AFTER GS-main has produced its generated index buffer, to permute
+       * the final raster stream Metal consumes. FIRST-provoking is left
+       * completely alone (Metal's default already matches it). */
+      if (!flatshade_first && fs && fs->info.fs.uses_flat_varyings) {
+         struct kk_device *dev = kk_cmd_buffer_device(cmd);
+
+         /* Minimal local VkDrawIndexedIndirectCommand-shaped descriptor
+          * describing the GS-generated raster stream (NOT the application
+          * draw -- kk_convert_to_indirect_draw() is tied to
+          * struct kk_draw_command and doesn't apply here). Layout must match
+          * what poly_setup_unroll_for_draw()/poly_unroll_geometry() read via
+          * in_draw[0..4]: indexCount, instanceCount, firstIndex,
+          * vertexOffset, firstInstance. */
+         VkDrawIndexedIndirectCommand in_draw = {
+            .indexCount = params.draw.index_count,
+            .instanceCount = params.draw.instance_count,
+            .firstIndex = 0,
+            .vertexOffset = 0,
+            .firstInstance = 0,
+         };
+         struct kk_ptr in_draw_ptr =
+            kk_pool_upload(cmd, &in_draw, sizeof(in_draw), 4u);
+
+         struct kk_ptr out_draw =
+            kk_pool_alloc(cmd, sizeof(VkDrawIndexedIndirectCommand), 4u);
+
+         if (likely(in_draw_ptr.gpu && out_draw.gpu)) {
+            struct libkk_unroll_geometry_args unroll_info = {
+               .index_buffer = index_addr,
+               .heap = kk_heap(cmd),
+               .in_draw = in_draw_ptr.gpu,
+               .out_draw = out_draw.gpu,
+               .in_draw_stride_el =
+                  sizeof(VkDrawIndexedIndirectCommand) / sizeof(uint32_t),
+               .restart_index = UINT32_MAX,
+               .index_buffer_size_el = params.draw.index_count,
+               .in_el_size_B = (uint32_t)sizeof(uint32_t),
+               .out_el_size_B = (uint32_t)sizeof(uint32_t),
+               .flatshade_first = false,
+               .mode = info.mode,
+            };
+
+            /* GS-main write -> barrier -> unroll read/write, mirroring the
+             * existing VS-before-GS/GS-main barrier pattern on this same
+             * compute encoder. */
+            mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                             MTL_STAGE_DISPATCH);
+            libkk_unroll_geometry_struct(cmd, kk_grid_1d(1024), true,
+                                         unroll_info);
+
+            draw.grid = kk_grid_indirect(out_draw.gpu);
+            draw.index.gpu.addr = dev->heap->gpu + sizeof(struct poly_heap);
+            draw.index.gpu.range =
+               dev->heap->size_B - sizeof(struct poly_heap);
+            draw.index.el_size_B = (uint32_t)sizeof(uint32_t);
+            draw.primitive_type =
+               mesa_prim_to_mtl_primitive_type(u_decomposed_prim(info.mode));
+         }
+      }
+   } else {
+      /* Non-indexed rast/copy draw (milestone-1's original shapes). */
+      draw.index.el_size_B = 0u;
+   }
+
+   return draw;
+}
+
 /* Get modifiable per draw data. */
 static struct kk_draw_data
 build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
                 uint32_t draw_id)
 {
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   bool gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
    struct kk_draw_data draw = {
       .index.gpu = data->index_buffer,
       .index.el_size_B = data->index_buffer_el_size_B,
-      .primitive_type = tess ? 0u : mesa_prim_to_mtl_primitive_type(data->prim),
+      .primitive_type = (tess || gs)
+                           ? 0u
+                           : mesa_prim_to_mtl_primitive_type(data->prim),
    };
 
    if (data->indirect) {
@@ -2071,6 +2319,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       return;
 
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+   bool gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
 
    /* Unroll geometry. Skip draw if we fail. */
    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
@@ -2084,6 +2333,9 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
       if (tess)
          draw_data = kk_launch_tess(cmd, draw_data);
+      else if (gs)
+         draw_data = kk_launch_gs(cmd, draw_data, data->prim,
+                                  data->flatshade_first);
 
       /* TODO_KOSMICKRISP Remove this once unroll, tess and any compute does not
        * split render pass */
