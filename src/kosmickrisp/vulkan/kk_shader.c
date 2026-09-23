@@ -384,14 +384,36 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
 }
 
-/* Lowering for the stage which ends up as the vertex stage on hardware */
+/* Lowering for the stage which ends up as the vertex stage on hardware.
+ *
+ * `is_gs_rast` marks a caller passing a geometry-shader rasterization
+ * shader (gs_rast) rather than an ordinary VS/TES. gs_rast's `nir->info.stage`
+ * is always MESA_SHADER_VERTEX (it is a generated hardware-VS shader), so it
+ * cannot be distinguished from an ordinary VS by stage alone -- the caller
+ * must say so explicitly.
+ *
+ * For gs_rast, point-ness depends solely on the GS's own resolved output
+ * primitive mode (carried in `force_point`), never on the application's
+ * input-assembly topology: a GS can have input_primitive==POINTS (so the
+ * app's IA topology is VK_PRIMITIVE_TOPOLOGY_POINT_LIST) while its resolved
+ * output primitive is triangles, in which case gs_rast must NOT be treated
+ * as a point shader even though the IA-topology check below would say so.
+ * `force_point` is then the complete answer -- there is no IA fallback for
+ * gs_rast.
+ *
+ * Ordinary VS/TES calls pass is_gs_rast=false, force_point=false, and get
+ * the original behavior unchanged. */
 static void
-kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
+kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+               bool is_gs_rast, bool force_point)
 {
    bool is_point =
-      nir->info.stage == MESA_SHADER_TESS_EVAL
-         ? nir->info.tess.point_mode
-         : state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+      is_gs_rast
+         ? force_point
+         : (nir->info.stage == MESA_SHADER_TESS_EVAL
+               ? nir->info.tess.point_mode
+               : state->ia->primitive_topology ==
+                    VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
    if (is_point)
       NIR_PASS(_, nir, msl_ensure_vertex_point_size_output);
    else
@@ -783,7 +805,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    if ((nir->info.stage == MESA_SHADER_VERTEX ||
         nir->info.stage == MESA_SHADER_TESS_EVAL) &&
        !emulated_stage) {
-      kk_lower_hw_vs(nir, state);
+      kk_lower_hw_vs(nir, state, false, false);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       kk_lower_fs(dev, nir, state);
    }
@@ -857,11 +879,30 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
          ralloc_free((void *)data->entrypoint_name);
          ralloc_free((void *)data->code);
       }
+
+      /* GEOMETRY's bit in additional_stages_bits only accounts for the
+       * rast/copy variant at msl_data[MESA_SHADER_GEOMETRY], freed above by
+       * the loop. The GS-main compute variant lives in the synthetic
+       * KK_GS_MAIN_SLOT and needs its own free. */
+      if (shader->info.vs.additional_stages_bits &
+          BITFIELD_BIT(MESA_SHADER_GEOMETRY)) {
+         struct msl_compile_data *data = &shader->msl_data[KK_GS_MAIN_SLOT];
+         ralloc_free((void *)data->entrypoint_name);
+         ralloc_free((void *)data->code);
+      }
    }
 
    struct msl_compile_data *data = &shader->msl_data[shader->info.stage];
    ralloc_free((void *)data->entrypoint_name);
    ralloc_free((void *)data->code);
+
+   /* A standalone GS-stage shader object owns both its rast/copy variant
+    * (freed above via msl_data[stage]) and its GS-main compute variant. */
+   if (shader->info.stage == MESA_SHADER_GEOMETRY) {
+      struct msl_compile_data *gs_main = &shader->msl_data[KK_GS_MAIN_SLOT];
+      ralloc_free((void *)gs_main->entrypoint_name);
+      ralloc_free((void *)gs_main->code);
+   }
 
    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
 }
@@ -979,6 +1020,82 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
    return progress;
 }
 
+/* gs_rast is cloned by poly_nir_lower_gs() from a nir that already went
+ * through kk_nir_lower_descriptors() (see kk_compile_shader()'s per-stage
+ * lowering). gs_rast itself never goes through kk_nir_lower_descriptors()
+ * again, but kk_lower_hw_vs(gs_rast, ...) -- called after the clone -- can
+ * still introduce brand-new intrinsics via nir_lower_clip_halfz_dynamic()
+ * (nir_lower_clip_halfz.c), specifically nir_intrinsic_load_clip_z_coeff,
+ * which would otherwise reach nir_to_msl unlowered.
+ *
+ * Rather than re-running the whole kk_nir_lower_descriptors() pass on
+ * gs_rast (double-lowering risk for anything else it might touch), this
+ * reuses the exact same expansion kk_nir_lower_descriptors.c's
+ * try_lower_intrin() uses for this one case (load_clip_z_coeff ->
+ * lower_sysval_to_root_table(b, intrin, draw.clip_z_coeff)), duplicated
+ * here read-only since its helpers are static to that file. */
+static bool
+kk_lower_gs_rast_clip_z_coeff(nir_builder *b, nir_intrinsic_instr *intrin,
+                              UNUSED void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_clip_z_coeff)
+      return false;
+
+   b->cursor = nir_instr_remove(&intrin->instr);
+
+   unsigned root_table_offset =
+      offsetof(struct kk_root_descriptor_table, draw.clip_z_coeff);
+   assert((root_table_offset & 3) == 0 && "aligned");
+
+   nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
+   nir_def *addr = nir_iadd(b, root, nir_u2u64(b, nir_imm_int(
+                                                       b, root_table_offset)));
+   nir_def *val = nir_build_load_global_constant(
+      b, intrin->def.num_components, intrin->def.bit_size, addr,
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+
+   nir_def_rewrite_uses(&intrin->def, val);
+   return true;
+}
+
+/* Same rationale as kk_lower_gs_rast_clip_z_coeff() above: gs_rast never
+ * goes through kk_nir_lower_descriptors() itself, but
+ * vertex_id_for_topology_class() (src/poly/nir/poly_nir_lower_gs.c, shared
+ * libpoly code) emits nir_intrinsic_load_provoking_last directly into
+ * gs_rast's own NIR as part of software input-assembly indexing, which
+ * would otherwise reach nir_to_msl unlowered.
+ *
+ * Reuses the exact same expansion kk_nir_lower_descriptors.c's
+ * lower_poly() uses for this one case (load_provoking_last ->
+ * lower_sysval_to_per_draw(b, intrin, provoking_last)), duplicated here
+ * read-only since its helpers are static to that file. Value is runtime
+ * per-draw state (0 = FIRST, 1 = LAST), populated in
+ * kk_upload_per_draw_data() from dyn->rs.provoking_vertex -- not a
+ * compile-time constant. */
+static bool
+kk_lower_gs_rast_provoking_last(nir_builder *b, nir_intrinsic_instr *intrin,
+                                UNUSED void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_provoking_last)
+      return false;
+
+   b->cursor = nir_instr_remove(&intrin->instr);
+
+   unsigned per_draw_offset =
+      offsetof(struct kk_per_draw_data, provoking_last);
+   assert((per_draw_offset & 3) == 0 && "aligned");
+
+   nir_def *per_draw = nir_load_per_draw_ptr_kk(b, 1, 64);
+   nir_def *addr =
+      nir_iadd(b, per_draw, nir_u2u64(b, nir_imm_int(b, per_draw_offset)));
+   nir_def *val = nir_build_load_global_constant(
+      b, intrin->def.num_components, intrin->def.bit_size, addr,
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+
+   nir_def_rewrite_uses(&intrin->def, val);
+   return true;
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -994,6 +1111,11 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    VkResult result = VK_SUCCESS;
 
    mesa_shader_stage stage = nir->info.stage;
+   /* Which shader->msl_data[] slot the shared tail below stores the (possibly
+    * stage-mutated) `nir` into. Only the GEOMETRY branch redirects this, to
+    * KK_GS_MAIN_SLOT, since msl_data[MESA_SHADER_GEOMETRY] is used for the
+    * rast/copy variant instead. */
+   mesa_shader_stage msl_slot = stage;
    shader = vk_shader_zalloc(&dev->vk, &kk_shader_ops, stage, pAllocator,
                              sizeof(*shader));
    if (shader == NULL) {
@@ -1014,7 +1136,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       /* VBO lowering needs to go here otherwise, the linking step removes all
        * inputs since we read vertex attributes from UBOs. */
       kk_lower_vs_vbo(nir, state, robustness);
-      if (nir->info.next_stage == MESA_SHADER_TESS_CTRL) {
+      if (nir->info.next_stage == MESA_SHADER_TESS_CTRL ||
+          nir->info.next_stage == MESA_SHADER_GEOMETRY) {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
          NIR_PASS(_, nir, kk_nir_lower_vertex_id_zero_base);
          nir->info.stage = MESA_SHADER_COMPUTE;
@@ -1048,6 +1171,121 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
 
       /* This destroys info so it needs to happen after the gather */
       NIR_PASS(_, nir, poly_nir_lower_tes, true);
+   } else if (stage == MESA_SHADER_GEOMETRY) {
+      nir_shader *gs_count = NULL, *gs_rast = NULL, *pre_gs = NULL;
+      /* Captured before poly_nir_lower_gs()/the compute-stage rewrite below
+       * overwrite nir->info.gs (same union member as nir->info.cs). Needed
+       * at draw time to pick the Metal primitive type for the rast/copy
+       * draw, since gs_rast's own stage is VERTEX (no output_primitive). */
+      enum mesa_prim gs_output_primitive = nir->info.gs.output_primitive;
+
+      NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_rast, &pre_gs,
+               &shader->info.gs.info);
+      shader->info.gs.output_primitive = gs_output_primitive;
+
+      /* Milestone-1 direct-draw-only scope: only shaders whose vertex/
+       * primitive counts are statically known (no count shader) are
+       * supported. Rasterization shape is non-indexed or
+       * POLY_GS_SHAPE_DYNAMIC_INDEXED (GS-main writes the generated uint32
+       * index buffer itself via poly_write_strip()/poly_pad_index_gs(); no
+       * pre_gs/count/prefix-sum dispatch is needed, see
+       * kk_upload_geometry_params() and kk_launch_gs() in kk_cmd_draw.c).
+       * poly_nir_lower_gs() always allocates `pre_gs` regardless, so it
+       * still needs freeing to avoid leaking its NIR. */
+      assert(gs_count == NULL &&
+             "KK GS milestone-1 requires statically-known GS counts");
+      ralloc_free(pre_gs);
+
+      /* gs_rast is a fresh hardware vertex shader created here, after the
+       * one-time per-app-shader kk_lower_nir() pass already ran on the
+       * original GS nir. It inherits already-lowered descriptors via the
+       * nir_shader_clone() inside poly_nir_lower_gs(), but still needs the
+       * same hw-vs-specific lowering a real VS/TES gets from kk_lower_nir().
+       */
+      assert(gs_rast->info.io_lowered);
+      /* gs_rast's point-ness must come from the GS's own resolved output
+       * primitive mode, not from the application's IA topology --
+       * kk_lower_hw_vs()'s topology-based check does not know this shader
+       * is actually rasterizing GS-generated points. gs_output_primitive
+       * was captured above, before poly_nir_lower_gs() reused
+       * nir->info.gs/cs storage for the compute-rewritten main GS shader,
+       * so it still reflects the original GS output_primitive.
+       * is_gs_rast=true means gs_rast_force_point is the complete
+       * point/non-point answer, with no IA-topology fallback (see
+       * kk_lower_hw_vs()'s doc comment). */
+      bool gs_rast_force_point = gs_output_primitive == MESA_PRIM_POINTS;
+      kk_lower_hw_vs(gs_rast, state, true, gs_rast_force_point);
+
+      /* gs_rast never goes through kk_nir_lower_descriptors() itself, so
+       * intrinsics introduced after the clone (by kk_lower_hw_vs() above,
+       * or emitted directly into gs_rast's NIR by shared libpoly lowering)
+       * need their own narrow, targeted lowering -- see the two helpers'
+       * doc comments above. */
+      NIR_PASS(_, gs_rast, nir_shader_intrinsics_pass,
+               kk_lower_gs_rast_clip_z_coeff, nir_metadata_control_flow,
+               NULL);
+      NIR_PASS(_, gs_rast, nir_shader_intrinsics_pass,
+               kk_lower_gs_rast_provoking_last, nir_metadata_control_flow,
+               NULL);
+
+      NIR_PASS(_, gs_rast, kk_nir_lower_poly);
+      msl_optimize_nir(gs_rast);
+      modify_nir_info(gs_rast);
+
+      /* gs_rast's per-EmitVertex "temp" position variables need explicit
+       * scalar/scratch lowering the normal msl_optimize_nir() pass does not
+       * fully resolve on its own, since only one of them is ever actually
+       * selected per invocation. nir_opt_dce before remove_dead_derefs
+       * prunes the ones that were promoted to SSA by
+       * nir_lower_vars_to_ssa but never selected. */
+      NIR_PASS(_, gs_rast, nir_opt_deref);
+      NIR_PASS(_, gs_rast, nir_lower_vars_to_ssa);
+      NIR_PASS(_, gs_rast, nir_opt_dce);
+      NIR_PASS(_, gs_rast, nir_remove_dead_derefs);
+      NIR_PASS(_, gs_rast, nir_remove_dead_variables,
+               nir_var_shader_temp | nir_var_function_temp, NULL);
+
+      /* nir_address_format_32bit_offset, not nir_address_format_62bit_generic:
+       * gs_rast is not MESA_SHADER_KERNEL, so nir_get_ptr_bitsize()
+       * (nir_builder.h) hardcodes every var-mode deref's SSA def to 32 bits
+       * regardless of nir_lower_vars_to_explicit_types -- 62bit_generic's
+       * 64-bit address can never match that. 32bit_offset produces
+       * load_scratch/store_scratch with a 32-bit offset instead, matching
+       * the deref's actual bit_size. Do NOT swap to 62bit_generic; do not
+       * fake-restage gs_rast to KERNEL. */
+      NIR_PASS(_, gs_rast, nir_lower_vars_to_explicit_types,
+               nir_var_shader_temp | nir_var_function_temp,
+               glsl_get_cl_type_size_align);
+      NIR_PASS(_, gs_rast, nir_lower_explicit_io,
+               nir_var_shader_temp | nir_var_function_temp,
+               nir_address_format_32bit_offset);
+      NIR_PASS(_, gs_rast, nir_opt_dce);
+
+      nir_validate_shader(gs_rast, "gs_rast after explicit-IO lowering");
+
+      struct nir_to_msl_options rast_translate_options = {
+         .mem_ctx = NULL,
+         .disabled_workarounds = pdev->settings.disabled_workarounds,
+      };
+      struct msl_compile_data *rast_data =
+         &shader->msl_data[MESA_SHADER_GEOMETRY];
+      rast_data->code = nir_to_msl(gs_rast, &rast_translate_options);
+      const char *rast_entrypoint_name =
+         nir_shader_get_entrypoint(gs_rast)->function->name;
+      ralloc_steal(NULL, (void *)rast_entrypoint_name);
+      rast_data->entrypoint_name = (char *)rast_entrypoint_name;
+      if (KK_DEBUG(MSL))
+         mesa_logi("%s\n", rast_data->code);
+      ralloc_free(gs_rast);
+
+      /* Main GS nir becomes a compute shader dispatched as (primitives,
+       * instances), mirroring the VS-before-{TCS,GS} compute prepass. Store
+       * it in the synthetic KK_GS_MAIN_SLOT instead of the shared tail's
+       * default msl_data[stage], which is now owned by gs_rast above. */
+      nir->info.stage = MESA_SHADER_COMPUTE;
+      memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+      nir->xfb_info = NULL;
+      msl_slot = KK_GS_MAIN_SLOT;
    }
 
    NIR_PASS(_, nir, kk_nir_lower_poly);
@@ -1079,7 +1317,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       }
    }
 
-   struct msl_compile_data *data = &shader->msl_data[stage];
+   struct msl_compile_data *data = &shader->msl_data[msl_slot];
    data->code = nir_to_msl(nir, &translate_options);
    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
 
@@ -1317,6 +1555,30 @@ kk_compile_depth_stencil_state(struct kk_device *device,
    return kk_compile_ds_state(device, &info);
 }
 
+/* Metal render pipeline descriptors need a primitive topology CLASS
+ * (point/line/triangle), separate from the exact draw-time primitive type
+ * (kk_cmd_draw.c's mesa_prim_to_mtl_primitive_type()). When a geometry
+ * shader is the final pre-raster stage, gs_rast's rasterization topology
+ * class must come from the GS's own resolved output primitive, not from
+ * vk_primitive_topology_to_mtl_primitive_topology_class(), which only
+ * understands the application's VkPrimitiveTopology domain. */
+static enum mtl_primitive_topology_class
+mesa_prim_to_mtl_primitive_topology_class(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_POINTS:
+      return MTL_PRIMITIVE_TOPOLOGY_CLASS_POINT;
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+      return MTL_PRIMITIVE_TOPOLOGY_CLASS_LINE;
+   case MESA_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLE_STRIP:
+      return MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE;
+   default:
+      UNREACHABLE("Unsupported GS raster output primitive");
+   }
+}
+
 /* Copies all msl shader data to the vertex and gathers information for pipeline
  * compilation. */
 static void
@@ -1371,6 +1633,13 @@ gather_graphics_pipeline_create_info(
       info->vs.sample_count = ms->rasterization_samples;
    }
 
+   /* Captured when a GS is found in the loop below: its resolved raster
+    * output primitive (struct poly_gs_info::mode), used to pick the render
+    * pipeline descriptor's topology class instead of the application's IA
+    * topology -- see mesa_prim_to_mtl_primitive_topology_class() above. */
+   bool has_gs = false;
+   enum mesa_prim gs_resolved_mode = MESA_PRIM_POINTS;
+
    /* We need to store all other stage sources in the vertex too otherwise we
     * won't be able to create the whole pipeline correctly. */
    for (uint32_t i = 1; i < shader_count; ++i) {
@@ -1390,6 +1659,33 @@ gather_graphics_pipeline_create_info(
 
       if (s->info.stage == MESA_SHADER_TESS_CTRL)
          info->vs.tess_local_thread_size = s->info.tess.tcs_output_patch_size;
+
+      /* GS has a second compiled variant (the GS-main compute program) in
+       * the synthetic KK_GS_MAIN_SLOT, which the loop above does not touch
+       * since it only copies msl_data[stage]. Copy it separately so
+       * kk_compile_graphics_pipeline() can find it on `vs` afterwards. */
+      if (s->info.stage == MESA_SHADER_GEOMETRY) {
+         has_gs = true;
+         gs_resolved_mode = s->info.gs.info.mode;
+
+         struct msl_compile_data *gs_src = &s->msl_data[KK_GS_MAIN_SLOT];
+         struct msl_compile_data *gs_dst = &vs->msl_data[KK_GS_MAIN_SLOT];
+         uint32_t gs_length = strlen(gs_src->code) + 1u;
+         gs_dst->code = ralloc_size(NULL, gs_length);
+         memcpy(gs_dst->code, gs_src->code, gs_length);
+
+         gs_length = strlen(gs_src->entrypoint_name) + 1;
+         gs_dst->entrypoint_name = ralloc_size(NULL, gs_length);
+         memcpy(gs_dst->entrypoint_name, gs_src->entrypoint_name, gs_length);
+
+         /* struct poly_gs_info is NOT merged into vs->info: it lives in the
+          * same top-level union as .vs, so writing it here would alias and
+          * corrupt the .vs fields just written above. Draw-time code reads
+          * it from the still-live standalone GS shader object instead
+          * (cmd->state.shaders[MESA_SHADER_GEOMETRY]->info.gs), mirroring
+          * how tess state is read from the standalone TCS/TES objects
+          * rather than from any merged copy on vs. */
+      }
    }
 
    uint8_t topology = state->ia->primitive_topology;
@@ -1411,8 +1707,13 @@ gather_graphics_pipeline_create_info(
       }
    }
 
+   /* Precedence: GS resolved output primitive (final pre-raster stage)
+    * overrides tessellation-resolved topology, which overrides the raw
+    * application IA topology. GS+tess combined is out of milestone-1
+    * scope, so this is a simple override rather than a merge. */
    info->vs.topology =
-      vk_primitive_topology_to_mtl_primitive_topology_class(topology);
+      has_gs ? mesa_prim_to_mtl_primitive_topology_class(gs_resolved_mode)
+             : vk_primitive_topology_to_mtl_primitive_topology_class(topology);
 }
 
 static VkResult
@@ -1429,17 +1730,38 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
     * previous stage. This means that any shader before that needs to be a
     * compute pipeline to be launched before the render pipeline. */
    uint32_t stages_bits = vs->info.vs.additional_stages_bits;
+   bool has_gs = stages_bits & BITFIELD_BIT(MESA_SHADER_GEOMETRY);
    pipe->gfx.pre_render_count = util_bitcount(stages_bits) - 1u;
+   /* GS needs two pre-render compute dispatches (VS-before-GS, then
+    * GS-main) ahead of the render pipeline's own vertex function
+    * (gs_rast), but GEOMETRY only contributes one bit to stages_bits since
+    * that bit is consumed below by gs_rast as the final vs_stage rather
+    * than by a pre-render slot. Fits within pre_render[3]: GS never
+    * combines with tess (out of milestone-1 scope), so this is at most 2. */
+   if (has_gs)
+      pipe->gfx.pre_render_count += 1u;
+
    for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i) {
       uint32_t local_thread_size =
          (i == 0u) ? 64u : vs->info.vs.tess_local_thread_size;
-      result = kk_compile_compute_pipeline(device, &vs->msl_data[vs_stage],
-                                           local_thread_size,
+      const struct msl_compile_data *src;
+      if (has_gs && i == 1u) {
+         /* GS-main compute: compiled from the synthetic slot instead of
+          * vs_stage, and does not consume/advance vs_stage since gs_rast
+          * (msl_data[MESA_SHADER_GEOMETRY]) is still needed afterwards as
+          * the final render-pipeline vertex function. */
+         src = &vs->msl_data[KK_GS_MAIN_SLOT];
+         local_thread_size = 64u;
+      } else {
+         src = &vs->msl_data[vs_stage];
+         vs_stage = u_bit_scan(&stages_bits);
+      }
+
+      result = kk_compile_compute_pipeline(device, src, local_thread_size,
                                            &pipe->gfx.pre_render[i]);
 
       if (result != VK_SUCCESS)
          return VK_ERROR_INVALID_SHADER_NV;
-      vs_stage = u_bit_scan(&stages_bits);
    }
 
    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
@@ -1535,14 +1857,16 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    nir_shader *nir_shaders[shader_count + 1u];
    struct kk_shader *shaders[shader_count + 1u];
 
-   /* Determine if the pipeline contains tessellation stages */
+   /* Determine if the pipeline contains tessellation or geometry stages */
    bool tess = false;
+   bool gs = false;
    for (uint32_t i = 0u; i < shader_count; ++i) {
       const struct vk_shader_compile_info *info = &infos[i];
       if (info->nir->info.stage == MESA_SHADER_TESS_CTRL ||
           info->nir->info.stage == MESA_SHADER_TESS_EVAL) {
          tess = true;
-         break;
+      } else if (info->nir->info.stage == MESA_SHADER_GEOMETRY) {
+         gs = true;
       }
    }
 
@@ -1553,9 +1877,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       const struct vk_shader_compile_info *info = &infos[i];
       nir_shader *nir = info->nir;
 
-      /* For tessellation pipelines, some stages may be emulated in compute */
-      bool emulated_stage = tess && (nir->info.stage == MESA_SHADER_VERTEX ||
-                                     nir->info.stage == MESA_SHADER_TESS_CTRL);
+      /* For tessellation pipelines, TCS and (when tess is present) VS are
+       * emulated in compute. For geometry pipelines, VS is also emulated in
+       * compute ahead of the GS-main compute dispatch (milestone-1: VS is
+       * never emulated for GS's sake unless GS is actually present, matching
+       * how tess only emulates VS when TCS/TES are actually present). */
+      bool emulated_stage =
+         (nir->info.stage == MESA_SHADER_VERTEX && (tess || gs)) ||
+         (nir->info.stage == MESA_SHADER_TESS_CTRL && tess);
 
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
@@ -1664,10 +1993,15 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
 
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
    kk_msl_serialize(shader, shader->info.stage, blob);
-   if (shader->info.stage == MESA_SHADER_VERTEX) {
+   if (shader->info.stage == MESA_SHADER_GEOMETRY) {
+      kk_msl_serialize(shader, KK_GS_MAIN_SLOT, blob);
+   } else if (shader->info.stage == MESA_SHADER_VERTEX) {
       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
          kk_msl_serialize(shader, stage, blob);
       }
+      if (shader->info.vs.additional_stages_bits &
+          BITFIELD_BIT(MESA_SHADER_GEOMETRY))
+         kk_msl_serialize(shader, KK_GS_MAIN_SLOT, blob);
    }
 
    return !blob->out_of_memory;
@@ -1721,9 +2055,19 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
 
    shader->info = info;
 
-   if (shader->info.stage == MESA_SHADER_VERTEX) {
+   if (shader->info.stage == MESA_SHADER_GEOMETRY) {
+      result = kk_msl_deserialize(blob, KK_GS_MAIN_SLOT, shader);
+      if (result != VK_SUCCESS)
+         goto fail;
+   } else if (shader->info.stage == MESA_SHADER_VERTEX) {
       u_foreach_bit(stage, shader->info.vs.additional_stages_bits) {
          result = kk_msl_deserialize(blob, stage, shader);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
+      if (shader->info.vs.additional_stages_bits &
+          BITFIELD_BIT(MESA_SHADER_GEOMETRY)) {
+         result = kk_msl_deserialize(blob, KK_GS_MAIN_SLOT, shader);
          if (result != VK_SUCCESS)
             goto fail;
       }
