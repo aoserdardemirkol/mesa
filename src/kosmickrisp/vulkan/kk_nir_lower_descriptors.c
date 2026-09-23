@@ -534,6 +534,28 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       return true;
    }
 
+   if (tex->op == nir_texop_custom_border_color_agx &&
+       (tex->backend_flags & KK_TEXTURE_FLAG_COMPARE_STATE)) {
+      assert(tex->def.num_components == 4 && tex->def.bit_size == 32);
+
+      nir_def *op = load_resource_deref_desc(
+         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
+         plane_offset_B +
+            offsetof(struct kk_sampled_image_descriptor, sampler_compare_op),
+         ctx);
+      nir_def *unorm_bits = load_resource_deref_desc(
+         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(texture)),
+         plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
+                                   image_depth_unorm_bits),
+         ctx);
+
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_def_replace(&tex->def, nir_vec4(b, nir_u2u32(b, op),
+                                          nir_u2u32(b, unorm_bits), zero,
+                                          zero));
+      return true;
+   }
+
    if (tex->op == nir_texop_custom_border_color_agx) {
       unsigned offs = offsetof(struct kk_sampled_image_descriptor, border);
 

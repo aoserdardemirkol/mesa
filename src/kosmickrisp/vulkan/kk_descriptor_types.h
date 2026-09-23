@@ -26,13 +26,23 @@ struct kk_sampled_image_descriptor {
    uint16_t image_min_lod_fp16;
    uint16_t image_min_lod_uint16;
 
-   uint16_t pad_to_64_bits;
+   uint16_t sampler_compare_op;
    uint32_t border[4];
-   uint64_t pad_to_power_2[3];
+
+   uint16_t image_depth_unorm_bits;
+   uint16_t pad0;
+   uint32_t pad1;
+   uint64_t pad_to_power_2[2];
 };
 
 static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
               "kk_sampled_image_descriptor has no holes");
+static_assert(offsetof(struct kk_sampled_image_descriptor, sampler_compare_op) == 22,
+              "kk_sampled_image_descriptor layout");
+static_assert(offsetof(struct kk_sampled_image_descriptor, border) == 24,
+              "kk_sampled_image_descriptor layout");
+static_assert(offsetof(struct kk_sampled_image_descriptor, image_depth_unorm_bits) == 40,
+              "kk_sampled_image_descriptor layout");
 
 struct kk_storage_image_descriptor {
    uint64_t image_gpu_resource_id;

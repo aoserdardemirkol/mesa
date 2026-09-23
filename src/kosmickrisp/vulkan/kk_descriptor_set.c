@@ -80,6 +80,8 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
          desc[plane].image_min_lod_fp16 = _mesa_float_to_half(min_lod);
          desc[plane].image_min_lod_uint16 = min_lod;
+         desc[plane].image_depth_unorm_bits =
+            view->vk.view_format == VK_FORMAT_D16_UNORM ? 16 : 0;
       }
    }
 
@@ -103,6 +105,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          desc[plane].sampler_lod_bias_fp16 = sampler->lod_bias_fp16;
          desc[plane].sampler_lod_min_fp16 = sampler->lod_min_fp16;
          desc[plane].sampler_lod_max_fp16 = sampler->lod_max_fp16;
+         desc[plane].sampler_compare_op = sampler->compare_op;
          desc[plane].clamp_0_sampler_index_or_negative = -1;
       }
 

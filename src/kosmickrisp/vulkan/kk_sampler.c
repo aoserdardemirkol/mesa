@@ -29,12 +29,12 @@ uses_border(const VkSamplerCreateInfo *info)
 }
 
 static bool
-is_border_color_custom(VkBorderColor color)
+is_border_color_custom(VkBorderColor color, bool compare)
 {
    /* If border color features are enabled, we need to workaround RGBA4 UNORM
     * issues with opaque black. This only affects float opaque black, there are
     * no pure integer RGBA4 formats to worry about. */
-   return color == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK ||
+   return (color == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK && !compare) ||
           color == VK_BORDER_COLOR_INT_CUSTOM_EXT ||
           color == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
 }
@@ -158,7 +158,8 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
 
    bool custom_border = dev->vk.enabled_features.customBorderColors &&
                         uses_border(pCreateInfo) &&
-                        is_border_color_custom(pCreateInfo->borderColor);
+                        is_border_color_custom(pCreateInfo->borderColor,
+                                               pCreateInfo->compareEnable);
 
    struct mtl_sampler_packed packed =
       pack_sampler_info(pCreateInfo, custom_border);
@@ -236,6 +237,7 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
    sampler->lod_bias_fp16 = _mesa_float_to_half(pCreateInfo->mipLodBias);
    sampler->lod_min_fp16 = _mesa_float_to_half(pCreateInfo->minLod);
    sampler->lod_max_fp16 = _mesa_float_to_half(pCreateInfo->maxLod);
+   sampler->compare_op = pCreateInfo->compareOp;
 
    *pSampler = kk_sampler_to_handle(sampler);
 
