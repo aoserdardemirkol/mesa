@@ -42,6 +42,14 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
 {
    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
 
+   if (cmd->xfb_abi_test_shader) {
+      if (cmd->state.shaders[MESA_SHADER_COMPUTE] ==
+          cmd->xfb_abi_test_shader)
+         cmd->state.shaders[MESA_SHADER_COMPUTE] = NULL;
+      kk_shader_destroy(&dev->vk, cmd->xfb_abi_test_shader, NULL);
+      cmd->xfb_abi_test_shader = NULL;
+   }
+
    kk_cmd_release_dynamic_ds_state(cmd);
    kk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
    kk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
@@ -411,18 +419,23 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
 {
    const VkAccessFlags2 texture_read_access =
       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
-      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT |
+      VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT;
    const VkAccessFlags2 any_write_access =
       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
       VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-      VK_ACCESS_2_MEMORY_WRITE_BIT;
+      VK_ACCESS_2_MEMORY_WRITE_BIT |
+      VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+      VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT;
    const VkAccessFlags2 ds_write_access =
       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
       VK_ACCESS_2_MEMORY_WRITE_BIT;
    const VkAccessFlags2 storage_write_access =
       VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-      VK_ACCESS_2_MEMORY_WRITE_BIT;
+      VK_ACCESS_2_MEMORY_WRITE_BIT |
+      VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+      VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT;
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    const bool has_ds =
       render->depth_att.iview != NULL || render->stencil_att.iview != NULL;

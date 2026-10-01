@@ -8,6 +8,7 @@ subdir('util')
 subdir('clc')
 subdir('libkk')
 subdir('vulkan')
+subdir('tests')
 
 executable(
     'kosmicomp',

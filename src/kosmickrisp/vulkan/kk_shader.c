@@ -844,7 +844,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
 
 static const struct vk_shader_ops kk_shader_ops;
 
-static void
+void
 kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
                   const VkAllocationCallbacks *pAllocator)
 {
@@ -938,11 +938,16 @@ fs_uses_flat_varying(nir_shader *nir)
 
 static void
 gather_shader_info(struct kk_shader *shader, nir_shader *nir,
-                   const struct vk_graphics_pipeline_state *state)
+                   const struct vk_graphics_pipeline_state *state,
+                   bool is_xfb_capture_stage)
 {
    shader->info.stage = nir->info.stage;
    shader->info.uses_per_draw_data = msl_gather_uses_per_draw_data(nir);
    shader->info.num_cull_distances = nir->info.cull_distance_array_size;
+   if (is_xfb_capture_stage && nir->xfb_info) {
+      kk_shader_info_copy_xfb(&shader->info, nir);
+      shader->info.uses_per_draw_data = true;
+   }
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       nir_shader_intrinsics_pass(nir, gather_vs_inputs, nir_metadata_all,
                                  &shader->info.vs.attribs_read);
@@ -1101,6 +1106,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
                   const struct vk_pipeline_robustness_state *robustness,
                   const struct vk_graphics_pipeline_state *state,
+                  bool is_xfb_capture_stage,
                   const VkAllocationCallbacks *pAllocator,
                   struct kk_shader **shader_out)
 {
@@ -1123,7 +1129,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
-   gather_shader_info(shader, nir, state);
+   gather_shader_info(shader, nir, state, is_xfb_capture_stage);
 
    unsigned num_cull_distances =
       prev_stage ? prev_stage->info.num_cull_distances : 0;
@@ -1149,6 +1155,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
           * is taken, since we launch compute, they correctly get translated.
           * For the non-emulated path we need to subtract base_instance... */
          NIR_PASS(_, nir, msl_nir_lower_instance_id);
+
    } else if (stage == MESA_SHADER_TESS_CTRL) {
       NIR_PASS(_, nir, poly_nir_lower_tcs, false);
 
@@ -1343,6 +1350,11 @@ static const struct vk_pipeline_robustness_state rs_none = {
    .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2,
 };
 
+static VkResult kk_compile_compute_pipeline(struct kk_device *device,
+                                            const struct msl_compile_data *data,
+                                            uint32_t local_size_threads,
+                                            mtl_compute_pipeline_state **pipe);
+
 VkResult
 kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
                       const VkAllocationCallbacks *alloc,
@@ -1357,10 +1369,29 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 
    struct kk_shader *shader = NULL;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   /* This entrypoint is also used by private/internal NIR shaders (for
+    * example the XFB ABI GPU probe), which do not arrive through the Vulkan
+    * pipeline compiler's normal shader preparation. Run the same KK NIR
+    * lowering contract used by graphics shaders before the compiler asserts
+    * that IO is lowered. Compute shaders do not consume graphics state. */
+   kk_lower_nir(dev, nir, false, &rs_none, 0u, NULL, NULL, 0);
    VkResult result =
-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader);
+      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, false, alloc,
+                        &shader);
    if (result != VK_SUCCESS)
       return result;
+
+   const uint32_t local_size_threads = shader->info.cs.local_size.x *
+                                       shader->info.cs.local_size.y *
+                                       shader->info.cs.local_size.z;
+   result = kk_compile_compute_pipeline(dev,
+                                        &shader->msl_data[MESA_SHADER_COMPUTE],
+                                        local_size_threads,
+                                        &shader->pipeline.cs);
+   if (result != VK_SUCCESS) {
+      kk_shader_destroy(&dev->vk, shader, alloc);
+      return vk_error(dev, result);
+   }
 
    *shader_out = shader;
 
@@ -1890,6 +1921,27 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
                    info->set_layout_count, info->set_layouts, state, features);
 
+      /* Preserve the final VS outputs only for a simple VS capture path.
+       * GS/TES pipelines select their eventual capture stage separately and
+       * are intentionally outside this change. */
+      if (nir->info.stage == MESA_SHADER_VERTEX && !tess && !gs &&
+          nir->xfb_info) {
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         nir_io_add_intrinsic_xfb_info(nir);
+
+         /* XFB stores must be introduced before the linked varying passes.
+          * They consume the lowered store_output intrinsics and produce global
+          * memory derefs, which the normal KK preparation below resolves. */
+         const nir_lower_xfb_to_stores_options xfb_options = {
+            .address_format = nir_address_format_64bit_global,
+            .keep_outputs = true,
+            .bounds_check = true,
+            .vertices_per_primitive = 3,
+         };
+         NIR_PASS(_, nir, nir_lower_xfb_to_stores, &xfb_options);
+         NIR_PASS(_, nir, kk_nir_lower_xfb_sysvals);
+      }
+
       if (nir->info.stage == MESA_SHADER_VERTEX)
          vertex_robustness = info->robustness;
 
@@ -1908,17 +1960,35 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
 
    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
                          UINT32_MAX, nir_opts, NULL);
+
    /* Second pass is required because some dEQP-VK.glsl.matrix.sub.dynamic.*
     * would fail otherwise due to vertex outputting vec4 while fragments reading
     * vec3 when in reality only vec3 is needed. */
    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
                          UINT32_MAX, nir_opts, NULL);
 
+   /* Varying optimization can materialize shader IO again. Re-run the normal
+    * KK preparation for the VS capture variant so the compiler invariant is
+    * established by its real IO-lowering pipeline, not by changing the flag. */
+   for (uint32_t i = 0; i < shader_count; i++) {
+      nir_shader *nir = nir_shaders[i];
+      if (nir->info.stage != MESA_SHADER_VERTEX || tess || gs ||
+          !nir->xfb_info || nir->info.io_lowered)
+         continue;
+
+      const struct vk_shader_compile_info *info = &infos[i];
+      kk_lower_nir(dev, nir, false, info->robustness,
+                   info->set_layout_count, info->set_layouts, state, features);
+   }
+
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
       result =
          kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
-                           state, pAllocator, &shaders[i]);
+                           state,
+                           nir_shaders[i]->info.stage == MESA_SHADER_VERTEX &&
+                              !tess && !gs && nir_shaders[i]->xfb_info,
+                           pAllocator, &shaders[i]);
 
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
@@ -2038,6 +2108,9 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
                       struct vk_shader **shader_out)
 {
    struct kk_device *dev = container_of(vk_dev, struct kk_device, vk);
+
+   if (binary_version != 1)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    struct kk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));

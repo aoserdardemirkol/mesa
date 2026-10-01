@@ -5,6 +5,7 @@
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_xfb_info.h"
 
 /*
  * Software transform feedback: lower store_output intrinsics that carry
@@ -26,13 +27,19 @@
  * the outputs.
  */
 
+struct lower_xfb_context {
+   const nir_lower_xfb_to_stores_options *options;
+   uint32_t record_extent_words[NIR_MAX_XFB_BUFFERS];
+};
+
 static void
 lower_xfb_output(nir_builder *b, nir_intrinsic_instr *intr,
                  unsigned start_component, unsigned num_components,
                  unsigned buffer, unsigned offset_words,
-                 nir_address_format address_format)
+                 const struct lower_xfb_context *ctx)
 {
-   unsigned address_bit_size = nir_address_format_bit_size(address_format);
+   unsigned address_bit_size =
+      nir_address_format_bit_size(ctx->options->address_format);
 
    assert(buffer < MAX_XFB_BUFFERS);
 
@@ -55,17 +62,53 @@ lower_xfb_output(nir_builder *b, nir_intrinsic_instr *intr,
                                        offset);
    nir_def *addr = nir_iadd(b, buf, nir_u2uN(b, word_offset, address_bit_size));
 
+   nir_if *bound_if = NULL;
+   if (ctx->options->bounds_check) {
+      assert(ctx->record_extent_words[buffer] != 0);
+
+      /* Compute the bound in 64 bits so an oversized vertex/instance index
+       * cannot wrap around and pass the range test. All stores belonging to
+       * one buffer use the full record extent, preventing partial records.
+       */
+      nir_def *instance_base = nir_imul(
+         b, nir_u2u64(b, nir_load_instance_id(b)),
+         nir_u2u64(b, nir_load_num_vertices(b)));
+      nir_def *wide_index = nir_iadd(
+         b, instance_base, nir_u2u64(b, nir_load_raw_vertex_id(b)));
+      nir_def *last_record_index = wide_index;
+      if (ctx->options->vertices_per_primitive > 0) {
+         const unsigned primitive_vertices =
+            ctx->options->vertices_per_primitive;
+         nir_def *raw_vertex_id = nir_load_raw_vertex_id(b);
+         nir_def *primitive_first = nir_imul_imm(
+            b, nir_udiv_imm(b, raw_vertex_id, primitive_vertices),
+            primitive_vertices);
+         last_record_index = nir_iadd(
+            b, nir_iadd(b, instance_base,
+                        nir_u2u64(b, primitive_first)),
+            nir_imm_int64(b, primitive_vertices - 1));
+      }
+      nir_def *record_end = nir_iadd_imm(
+         b, nir_imul_imm(b, last_record_index, stride),
+         ctx->record_extent_words[buffer] * 4);
+      nir_def *range = nir_u2u64(
+         b, nir_load_xfb_size(b, .base = buffer));
+      bound_if = nir_push_if(b, nir_uge(b, range, record_end));
+   }
+
    nir_def *src = intr->src[0].ssa;
    nir_component_mask_t mask = nir_component_mask(num_components);
    mask = (mask << start_component) >> nir_intrinsic_component(intr);
    nir_def *value = nir_channels(b, src, mask);
    nir_store_global(b, value, addr);
+   if (bound_if)
+      nir_pop_if(b, bound_if);
 }
 
 static bool
 lower_xfb(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   const nir_lower_xfb_to_stores_options *options = data;
+   const struct lower_xfb_context *ctx = data;
 
    /* In transform feedback programs, vertex ID becomes zero-based, so apply
     * that lowering even on Valhall.
@@ -94,11 +137,11 @@ lower_xfb(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       lower_xfb_output(b, intr, i, xfb.out[i].num_components,
                         xfb.out[i].buffer, xfb.out[i].offset,
-                        options->address_format);
+                        ctx);
       progress = true;
    }
 
-   if (!options->keep_outputs)
+   if (!ctx->options->keep_outputs)
       nir_instr_remove(&intr->instr);
 
    return progress;
@@ -110,6 +153,34 @@ nir_lower_xfb_to_stores(nir_shader *nir, const nir_lower_xfb_to_stores_options *
    assert(options->address_format == nir_address_format_32bit_global ||
           options->address_format == nir_address_format_64bit_global);
 
-   return nir_shader_intrinsics_pass(
-      nir, lower_xfb, nir_metadata_control_flow, (void *)options);
+   struct lower_xfb_context ctx = {.options = options};
+
+   if (options->bounds_check) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_store_output)
+                  continue;
+
+               nir_io_xfb xfb = nir_intrinsic_io_xfb(intr);
+               for (unsigned i = 0; i < 4; i++) {
+                  if (!xfb.out[i].num_components)
+                     continue;
+                  unsigned buffer = xfb.out[i].buffer;
+                  assert(buffer < NIR_MAX_XFB_BUFFERS);
+                  ctx.record_extent_words[buffer] = MAX2(
+                     ctx.record_extent_words[buffer],
+                     xfb.out[i].offset + xfb.out[i].num_components);
+               }
+            }
+         }
+      }
+   }
+
+   return nir_shader_intrinsics_pass(nir, lower_xfb,
+                                     nir_metadata_control_flow, &ctx);
 }

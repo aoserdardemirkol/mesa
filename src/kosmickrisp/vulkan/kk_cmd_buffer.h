@@ -14,6 +14,7 @@
 #include "kk_image.h"
 #include "kk_nir_lower_vbo.h"
 #include "kk_shader.h"
+#include "kk_xfb_abi.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
@@ -26,6 +27,41 @@
 #include <stdio.h>
 
 struct kk_query_pool;
+
+struct kk_xfb_query_state {
+   struct kk_query_pool *pool;
+   uint32_t query;
+   uint64_t report_addr;
+   bool active;
+};
+
+struct kk_primitives_generated_query_state {
+   struct kk_query_pool *pool;
+   uint32_t query;
+   uint64_t report_addr;
+   bool active;
+};
+
+/* Private entrypoint for the kk-gpu-tests runtime ABI probe. */
+VkResult kk_test_record_xfb_abi_probe(VkCommandBuffer commandBuffer,
+                                      bool enabled,
+                                      VkDeviceAddress buffer_address,
+                                      VkDeviceSize range,
+                                      VkDeviceSize binding_offset,
+                                      VkDeviceSize current_offset,
+                                      VkDeviceAddress diagnostic_address,
+                                      VkDeviceSize diagnostic_range);
+VkResult kk_test_set_xfb_capture_target(VkCommandBuffer commandBuffer,
+                                         VkDeviceAddress buffer_address,
+                                         VkDeviceSize range,
+                                         VkDeviceSize binding_offset,
+                                         VkDeviceSize current_offset);
+VkResult kk_test_begin_xfb(VkCommandBuffer commandBuffer,
+                           VkDeviceAddress counter_buffer_address,
+                           VkDeviceSize counter_buffer_offset);
+VkResult kk_test_end_xfb(VkCommandBuffer commandBuffer,
+                         VkDeviceAddress counter_buffer_address,
+                         VkDeviceSize counter_buffer_offset);
 
 struct kk_root_descriptor_table {
    uint64_t addr;
@@ -76,6 +112,7 @@ struct kk_descriptor_state {
 struct kk_per_draw_data {
    uint32_t draw_id;
    uint32_t index_size;
+   uint32_t vertex_count;
 
    /* Effective Vulkan provoking-vertex mode for this draw: 0 = FIRST,
     * 1 = LAST. Consumed by nir_intrinsic_load_provoking_last (lowered in
@@ -98,6 +135,11 @@ struct kk_per_draw_data {
 
    uint64_t base_vertex_addr;
    uint64_t base_instance_addr;
+
+   /* Internal Vulkan XFB destination values. Kept separate until the NIR
+    * sysval lowering forms the effective address and remaining range.
+    */
+   struct kk_xfb_binding xfb[KK_XFB_BUFFER_COUNT];
 };
 
 struct kk_attachment {
@@ -152,6 +194,12 @@ struct kk_graphics_state {
    struct kk_rendering_state render;
    struct kk_descriptor_state descriptors;
    struct kk_per_draw_data per_draw_data;
+   struct kk_xfb_binding xfb[KK_XFB_BUFFER_COUNT];
+   bool xfb_active;
+   /* GPU-owned uint32 current counters followed by per-draw uint32 snapshots. */
+   uint64_t xfb_runtime_state_addr;
+   struct kk_xfb_query_state xfb_query;
+   struct kk_primitives_generated_query_state pg_query;
 
    mtl_depth_stencil_state *depth_stencil_state;
    mtl_render_pass_descriptor *render_pass_descriptor;
@@ -275,6 +323,11 @@ struct kk_cmd_buffer {
    } state;
 
    struct kk_uploader uploader;
+
+   /* Owned by a private GPU ABI validation command until command-buffer reset
+    * or destruction. Normal Vulkan command buffers leave this NULL.
+    */
+   struct kk_shader *xfb_abi_test_shader;
 
    /* Owned large BOs */
    struct util_dynarray large_bos;

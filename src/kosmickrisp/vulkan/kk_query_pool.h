@@ -42,5 +42,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
 
 uint16_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
+uint64_t kk_xfb_query_report_address(struct kk_query_pool *pool,
+                                    uint32_t query);
+uint64_t kk_primitives_generated_query_report_address(
+   struct kk_query_pool *pool, uint32_t query);
 
 #endif /* KK_QUERY_POOL_H */

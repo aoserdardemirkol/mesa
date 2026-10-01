@@ -38,6 +38,10 @@ kk_reports_per_query(struct kk_query_pool *pool)
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
       return 1;
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      return 2;
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      return 1;
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -69,15 +73,32 @@ kk_pool_is_ts(struct kk_query_pool *pool)
    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
 }
 
+static inline bool
+kk_pool_is_xfb(struct kk_query_pool *pool)
+{
+   return pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+}
+
+static inline bool
+kk_pool_is_pg(struct kk_query_pool *pool)
+{
+   return pool->vk.query_type == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT;
+}
+
 static uint64_t
 kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
                      uint32_t query)
 {
+   if (kk_pool_is_xfb(pool))
+      return kk_xfb_query_report_address(pool, query);
+
    struct kk_bo *bo =
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
+   uint32_t index = (kk_pool_is_ts(pool) || kk_pool_is_xfb(pool) ||
+                     kk_pool_is_pg(pool))
+                       ? query
+                       : kk_pool_index_ptr(pool)[query];
    return bo->gpu + pool->query_start + (index * sizeof(uint64_t));
 }
 
@@ -96,10 +117,30 @@ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    uint64_t *queries = (uint64_t *)(bo->cpu + pool->query_start);
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
+   uint32_t index = (kk_pool_is_ts(pool) || kk_pool_is_xfb(pool) ||
+                     kk_pool_is_pg(pool))
+                       ? query
+                       : kk_pool_index_ptr(pool)[query];
 
-   return (struct kk_query_report *)&queries[index];
+   return (struct kk_query_report *)&queries[
+      index * kk_reports_per_query(pool)];
+}
+
+uint64_t
+kk_xfb_query_report_address(struct kk_query_pool *pool, uint32_t query)
+{
+   assert(kk_pool_is_xfb(pool));
+   assert(query < pool->vk.query_count);
+   return pool->bo->gpu + pool->query_start + query * pool->query_stride;
+}
+
+uint64_t
+kk_primitives_generated_query_report_address(struct kk_query_pool *pool,
+                                              uint32_t query)
+{
+   assert(kk_pool_is_pg(pool));
+   assert(query < pool->vk.query_count);
+   return pool->bo->gpu + pool->query_start + query * pool->query_stride;
 }
 
 static void
@@ -261,7 +302,10 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
    struct libkk_reset_query_args info = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = (kk_pool_is_ts(pool) || kk_pool_is_xfb(pool) ||
+                   kk_pool_is_pg(pool))
+                     ? 0u
+                     : pool->bo->gpu + pool->index_start,
 
       .first_query = first_index,
       .reports_per_query = kk_reports_per_query(pool),
@@ -324,6 +368,7 @@ static const StageMapping stage_lut[] = {
        VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
        VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
        VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+       VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |
        VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
        VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
        VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT |
@@ -414,12 +459,66 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    }
 }
 
-VKAPI_ATTR void VKAPI_CALL
-kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
-                 uint32_t query, VkQueryControlFlags flags)
+static void
+kk_begin_query(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+               uint32_t query, VkQueryControlFlags flags, uint32_t index)
 {
-   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
-   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   if (query >= pool->vk.query_count) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   if (kk_pool_is_xfb(pool)) {
+      if (index != 0 || cmd->state.gfx.xfb_query.active) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+         return;
+      }
+
+      /* The report initialization must be ordered before any draw's XFB
+       * counter kernel. Split an active render encoder so these GPU writes are
+       * not deferred until after the draw. */
+      cs_end(cmd);
+      const uint64_t report = kk_xfb_query_report_address(pool, query);
+      const uint64_t availability = kk_query_available_addr(pool, query);
+      for (unsigned i = 0; i < 4; i++)
+         kk_cmd_write(cmd, (struct libkk_imm_write){report + i * 4, 0});
+      kk_cmd_write(cmd, (struct libkk_imm_write){availability, 0});
+
+      cmd->state.gfx.xfb_query = (struct kk_xfb_query_state){
+         .pool = pool,
+         .query = query,
+         .report_addr = report,
+         .active = true,
+      };
+      return;
+   }
+
+   if (kk_pool_is_pg(pool)) {
+      if (index != 0 || cmd->state.gfx.pg_query.active) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+         return;
+      }
+
+      cs_end(cmd);
+      const uint64_t report =
+         kk_primitives_generated_query_report_address(pool, query);
+      const uint64_t availability = kk_query_available_addr(pool, query);
+      kk_cmd_write(cmd, (struct libkk_imm_write){report, 0});
+      kk_cmd_write(cmd, (struct libkk_imm_write){availability, 0});
+      cmd->state.gfx.pg_query = (struct kk_primitives_generated_query_state){
+         .pool = pool,
+         .query = query,
+         .report_addr = report,
+         .active = true,
+      };
+      return;
+   }
+
+   if (index != 0 || !kk_pool_is_oq(pool)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
@@ -428,12 +527,52 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->state.gfx.occlusion.index = remap_index[query];
 }
 
-VKAPI_ATTR void VKAPI_CALL
-kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
-               uint32_t query)
+static void
+kk_end_query(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+             uint32_t query, uint32_t index)
 {
-   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
-   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   if (query >= pool->vk.query_count) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   if (kk_pool_is_xfb(pool)) {
+      if (index != 0 || !cmd->state.gfx.xfb_query.active ||
+          cmd->state.gfx.xfb_query.pool != pool ||
+          cmd->state.gfx.xfb_query.query != query) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+         return;
+      }
+
+      cs_end(cmd);
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           kk_query_available_addr(pool, query), 1});
+      memset(&cmd->state.gfx.xfb_query, 0,
+             sizeof(cmd->state.gfx.xfb_query));
+      return;
+   }
+
+   if (kk_pool_is_pg(pool)) {
+      if (index != 0 || !cmd->state.gfx.pg_query.active ||
+          cmd->state.gfx.pg_query.pool != pool ||
+          cmd->state.gfx.pg_query.query != query) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+         return;
+      }
+
+      cs_end(cmd);
+      kk_cmd_write(cmd, (struct libkk_imm_write){
+                           kk_query_available_addr(pool, query), 1});
+      memset(&cmd->state.gfx.pg_query, 0,
+             sizeof(cmd->state.gfx.pg_query));
+      return;
+   }
+
+   if (index != 0 || !kk_pool_is_oq(pool)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
    cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
 
@@ -454,6 +593,43 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
       kk_cmd_write(cmd, (struct libkk_imm_write){addr, true});
       addr += sizeof(uint32_t);
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                 uint32_t query, VkQueryControlFlags flags)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_begin_query(cmd, pool, query, flags, 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+               uint32_t query)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_end_query(cmd, pool, query, 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                           uint32_t query, VkQueryControlFlags flags,
+                           uint32_t index)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_begin_query(cmd, pool, query, flags, index);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                         uint32_t query, uint32_t index)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   kk_end_query(cmd, pool, query, index);
 }
 
 static bool
@@ -581,7 +757,10 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    struct libkk_copy_queries_args args = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = (kk_pool_is_ts(pool) || kk_pool_is_xfb(pool) ||
+                   kk_pool_is_pg(pool))
+                     ? 0u
+                     : pool->bo->gpu + pool->index_start,
       .dst_addr = pDstRange->address,
       .dst_stride = pDstRange->stride,
       .first_query = firstQuery,

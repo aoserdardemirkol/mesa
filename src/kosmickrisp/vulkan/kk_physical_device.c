@@ -201,6 +201,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
+      .EXT_transform_feedback = true,
+      .EXT_primitives_generated_query = true,
 #ifdef KK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
@@ -267,6 +269,17 @@ kk_get_device_features(
        * as a permanent capability claim without further validation. */
       .geometryShader = true,
       .tessellationShader = true,
+      /* Private KK XFB capture is currently limited to stream 0 and one
+       * buffer. Geometry shader stream output is not implemented. */
+      .transformFeedback = true,
+      .geometryStreams = false,
+      /* PGQ is computed from the final emitted primitive stream on the GPU.
+       * The current query implementation does not claim validity with
+       * rasterizer discard or non-zero XFB streams. */
+      .primitivesGeneratedQuery =
+         supported_extensions->EXT_primitives_generated_query,
+      .primitivesGeneratedQueryWithRasterizerDiscard = false,
+      .primitivesGeneratedQueryWithNonZeroStreams = false,
       .textureCompressionASTC_LDR = true,
       .textureCompressionBC = true,
       .textureCompressionETC2 = true,
@@ -888,19 +901,19 @@ kk_get_device_properties(
       .variableSampleLocations = true,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = 0,
+      .shaderBinaryVersion = 1,
 
       /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 4,
-      .maxTransformFeedbackBuffers = 4,
-      .maxTransformFeedbackBufferSize = UINT32_MAX,
-      .maxTransformFeedbackStreamDataSize = 2048,
-      .maxTransformFeedbackBufferDataSize = 512,
-      .maxTransformFeedbackBufferDataStride = 2048,
+      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackBuffers = 1,
+      .maxTransformFeedbackBufferSize = pdev->info.max_buffer_size,
+      .maxTransformFeedbackStreamDataSize = 16,
+      .maxTransformFeedbackBufferDataSize = 16,
+      .maxTransformFeedbackBufferDataStride = 16,
       .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = true,
-      .transformFeedbackDraw = true,
+      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackDraw = false,
 
       /* VK_KHR_vertex_attribute_divisor */
       .maxVertexAttribDivisor = UINT32_MAX,

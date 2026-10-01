@@ -131,10 +131,17 @@ struct ${to_struct_name(c.name)} {
 
 struct vk_cmd_queue_entry;
 
+typedef void (*vk_cmd_queue_custom_execute_fn)(VkCommandBuffer commandBuffer,
+                                               const void *data);
+
 struct vk_cmd_queue_entry {
    struct list_head cmd_link;
    enum vk_cmd_type type;
    union {
+      struct {
+         vk_cmd_queue_custom_execute_fn execute;
+         const void *data;
+      } custom;
 % for c in commands:
 % if len(c.params) <= 1:
 <% continue %>
@@ -169,6 +176,10 @@ struct vk_cmd_queue_entry {
 % endfor
 
 void vk_free_queue(struct vk_cmd_queue *queue);
+
+bool vk_cmd_queue_enqueue_custom(struct vk_cmd_queue *queue,
+                                 vk_cmd_queue_custom_execute_fn execute,
+                                 const void *data, size_t data_size);
 
 static inline void
 vk_cmd_queue_init(struct vk_cmd_queue *queue)
@@ -418,6 +429,33 @@ ${get_params_copy(c, types)}}
 
 % endfor
 
+bool
+vk_cmd_queue_enqueue_custom(struct vk_cmd_queue *queue,
+                            vk_cmd_queue_custom_execute_fn execute,
+                            const void *data, size_t data_size)
+{
+   assert(execute != NULL);
+
+   struct vk_cmd_queue_entry *cmd =
+      linear_zalloc_child(queue->ctx, sizeof(*cmd));
+   if (!cmd)
+      return false;
+
+   void *copy = NULL;
+   if (data_size > 0) {
+      copy = linear_alloc_child(queue->ctx, data_size);
+      if (!copy)
+         return false;
+      memcpy(copy, data, data_size);
+   }
+
+   cmd->type = VK_CMD_TYPE_COUNT;
+   cmd->u.custom.execute = execute;
+   cmd->u.custom.data = copy;
+   list_addtail(&cmd->cmd_link, &queue->cmds);
+   return true;
+}
+
 void
 vk_free_queue(struct vk_cmd_queue *queue)
 {
@@ -442,6 +480,11 @@ vk_cmd_queue_execute(struct vk_cmd_queue *queue,
                      const struct vk_device_dispatch_table *disp)
 {
    list_for_each_entry(struct vk_cmd_queue_entry, cmd, &queue->cmds, cmd_link) {
+      if (cmd->type == VK_CMD_TYPE_COUNT) {
+         cmd->u.custom.execute(commandBuffer, cmd->u.custom.data);
+         continue;
+      }
+
       switch (cmd->type) {
 % for c in commands:
 % if c.guard is not None:

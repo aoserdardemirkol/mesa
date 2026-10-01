@@ -24,7 +24,12 @@
 #include "poly/geometry.h"
 #include "poly/tessellator.h"
 
+#include "nir_builder.h"
+#include "nir_builder_opcodes.h"
+
+
 #include "vulkan/runtime/vk_render_pass.h"
+#include "vulkan/runtime/vk_common_entrypoints.h"
 #include "vulkan/util/vk_format.h"
 
 static void
@@ -1124,7 +1129,36 @@ struct kk_draw_data {
    } index;
    uint32_t vertex_offset;
    enum mtl_primitive_type primitive_type;
+   VkPrimitiveTopology query_topology;
+   uint32_t query_restart_index;
+   bool query_restart;
 };
+
+static VkPrimitiveTopology
+kk_prim_to_vk_topology(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_POINTS: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+   case MESA_PRIM_LINES: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+   case MESA_PRIM_LINE_STRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+   case MESA_PRIM_TRIANGLES: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   case MESA_PRIM_TRIANGLE_STRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   case MESA_PRIM_PATCHES:
+      /* Replaced with tessellator output topology before PGQ dispatch. */
+      return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+   default:
+      UNREACHABLE("unsupported final primitive topology for PGQ");
+   }
+}
 
 static uint64_t
 kk_upload_vertex_params(struct kk_cmd_buffer *cmd,
@@ -1945,10 +1979,27 @@ upload_base_instance(struct kk_cmd_buffer *cmd, const struct kk_draw_data *data)
  * values not present in Metal such as drawID. */
 static void
 kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
-                        uint32_t draw_id, const struct kk_draw_data *draw)
+                        uint32_t draw_id, const struct kk_draw_data *draw,
+                        bool xfb_capture_supported)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    gfx->per_draw_data.draw_id = draw_id;
+   gfx->per_draw_data.vertex_count =
+      kk_grid_is_indirect(draw->grid) ? 0 : draw->grid.size.x;
+
+   for (unsigned i = 0; i < KK_XFB_BUFFER_COUNT; i++) {
+      if (xfb_capture_supported) {
+         kk_xfb_binding_copy_to_draw(&gfx->per_draw_data.xfb[i],
+                                     &gfx->xfb[i]);
+         if (gfx->xfb_runtime_state_addr)
+            gfx->per_draw_data.xfb[i].current_offset_addr =
+               gfx->xfb_runtime_state_addr +
+               (KK_XFB_BUFFER_COUNT + i) * sizeof(uint32_t);
+      } else {
+         memset(&gfx->per_draw_data.xfb[i], 0,
+                sizeof(gfx->per_draw_data.xfb[i]));
+      }
+   }
 
    /* Prepare emulation data for tessellation. */
    bool tess = upload_mask & BITFIELD_BIT(MESA_SHADER_TESS_EVAL);
@@ -1995,6 +2046,395 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
       return;
 
    mtl_set_address(cmd->argument_table, shader_data_gpu.gpu, 2u);
+}
+
+/* Private runtime validation hook used only by kk-gpu-tests. This records a
+ * normal KK compute dispatch whose NIR reads the production XFB sysvals and
+ * stores their values to a real GPU buffer. It is intentionally not a Vulkan
+ * entrypoint and does not expose any XFB capability.
+ */
+__attribute__((visibility("default"))) VkResult
+kk_test_record_xfb_abi_probe(VkCommandBuffer commandBuffer, bool enabled,
+                             VkDeviceAddress buffer_address,
+                             VkDeviceSize range, VkDeviceSize binding_offset,
+                             VkDeviceSize current_offset,
+                             VkDeviceAddress diagnostic_address,
+                             VkDeviceSize diagnostic_range)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       cmd->xfb_abi_test_shader)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   memset(cmd->state.gfx.xfb, 0, sizeof(cmd->state.gfx.xfb));
+   if (enabled &&
+       !kk_xfb_binding_configure(&cmd->state.gfx.xfb[0], buffer_address,
+                                 range, binding_offset, current_offset))
+      return VK_ERROR_VALIDATION_FAILED;
+
+   if (!kk_xfb_binding_configure(&cmd->state.gfx.xfb[1], diagnostic_address,
+                                 diagnostic_range, 0, 0) ||
+       diagnostic_range < 12)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "KK XFB per-draw ABI GPU probe");
+   nir_def *address = nir_load_xfb_address(&b, 64, .base = 0);
+   nir_def *size = nir_load_xfb_size(&b, .base = 0);
+   nir_def *diagnostic = nir_load_xfb_address(&b, 64, .base = 1);
+   nir_store_global(&b, nir_u2u32(&b, address), diagnostic,
+                    .write_mask = 1, .align_mul = 4);
+   nir_store_global(&b, nir_u2u32(&b, nir_ushr_imm(&b, address, 32)),
+                    nir_iadd_imm(&b, diagnostic, 4), .write_mask = 1,
+                    .align_mul = 4);
+   nir_store_global(&b, size, nir_iadd_imm(&b, diagnostic, 8),
+                    .write_mask = 1, .align_mul = 4);
+
+   struct kk_shader *shader = NULL;
+   VkResult result = kk_compile_nir_shader(dev, b.shader, NULL, &shader);
+   if (result != VK_SUCCESS)
+      return result;
+
+   cmd->xfb_abi_test_shader = shader;
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = shader;
+   struct kk_draw_data empty_draw = {0};
+   kk_upload_per_draw_data(cmd, BITFIELD_BIT(MESA_SHADER_VERTEX), 0,
+                           &empty_draw, true);
+   vk_common_CmdDispatch(commandBuffer, 1, 1, 1);
+   return VK_SUCCESS;
+}
+
+/* Internal XFB session lifecycle. Counters are byte offsets relative to each
+ * bound range. These state helpers are deliberately not Vulkan entrypoints;
+ * a future extension command can translate its bind/begin/end arguments here.
+ */
+static VkResult
+kk_xfb_begin(struct kk_cmd_buffer *cmd,
+             const VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT])
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->xfb_active)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   for (unsigned i = 0; i < KK_XFB_BUFFER_COUNT; i++) {
+      const struct kk_xfb_binding *binding = &gfx->xfb[i];
+      if (binding->binding_offset > binding->range ||
+          (counter_addresses[i] & (sizeof(uint32_t) - 1)) != 0)
+         return VK_ERROR_VALIDATION_FAILED;
+   }
+
+   struct kk_ptr state = kk_pool_alloc(
+      cmd, 2 * KK_XFB_BUFFER_COUNT * sizeof(uint32_t), sizeof(uint32_t));
+   if (!state.gpu)
+      return cmd->vk.record_result;
+
+   struct kk_ptr sources = kk_pool_upload(
+      cmd, counter_addresses,
+      KK_XFB_BUFFER_COUNT * sizeof(counter_addresses[0]), sizeof(uint64_t));
+   if (!sources.gpu)
+      return cmd->vk.record_result;
+
+   libkk_xfb_counter_begin(cmd, kk_grid_1d(KK_XFB_BUFFER_COUNT), false,
+                           state.gpu, sources.gpu);
+
+   gfx->xfb_runtime_state_addr = state.gpu;
+   for (unsigned i = 0; i < KK_XFB_BUFFER_COUNT; i++)
+      gfx->xfb[i].current_offset = 0;
+
+   gfx->xfb_active = true;
+   return VK_SUCCESS;
+}
+
+static VkResult
+kk_xfb_end(struct kk_cmd_buffer *cmd,
+           const VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT])
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if (!gfx->xfb_active)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   for (unsigned i = 0; i < KK_XFB_BUFFER_COUNT; i++) {
+      if ((counter_addresses[i] & (sizeof(uint32_t) - 1)) != 0)
+         return VK_ERROR_VALIDATION_FAILED;
+   }
+
+   bool has_counter_dest = false;
+   for (unsigned i = 0; i < KK_XFB_BUFFER_COUNT; i++)
+      has_counter_dest |= counter_addresses[i] != 0;
+
+   if (has_counter_dest) {
+      struct kk_ptr destinations = kk_pool_upload(
+         cmd, counter_addresses,
+         KK_XFB_BUFFER_COUNT * sizeof(counter_addresses[0]), sizeof(uint64_t));
+      if (!destinations.gpu)
+         return cmd->vk.record_result;
+
+      libkk_xfb_counter_end(cmd, kk_grid_1d(KK_XFB_BUFFER_COUNT), false,
+                            gfx->xfb_runtime_state_addr, destinations.gpu);
+   }
+
+   gfx->xfb_active = false;
+   return VK_SUCCESS;
+}
+
+static VkResult
+kk_xfb_bind_buffer(struct kk_graphics_state *gfx, uint32_t binding,
+                   VkDeviceAddress buffer_address, VkDeviceSize range,
+                   VkDeviceSize binding_offset,
+                   VkDeviceSize current_offset)
+{
+   if (gfx->xfb_active || binding >= KK_XFB_BUFFER_COUNT ||
+       !kk_xfb_binding_configure(&gfx->xfb[binding], buffer_address, range,
+                                 binding_offset, current_offset))
+      return VK_ERROR_VALIDATION_FAILED;
+
+   return VK_SUCCESS;
+}
+
+static bool
+kk_xfb_counter_buffer_address(VkBuffer buffer_handle, VkDeviceSize offset,
+                              VkDeviceAddress *address_out)
+{
+   *address_out = 0;
+   if (buffer_handle == VK_NULL_HANDLE)
+      return true;
+
+   VK_FROM_HANDLE(kk_buffer, buffer, buffer_handle);
+   if (!(buffer->vk.usage & VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT) ||
+       offset > buffer->vk.size || buffer->vk.size - offset < sizeof(uint32_t) ||
+       (offset & (sizeof(uint32_t) - 1)) != 0)
+      return false;
+
+   *address_out = vk_buffer_address(&buffer->vk, offset);
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBindTransformFeedbackBuffersEXT(
+   VkCommandBuffer commandBuffer, uint32_t firstBinding,
+   uint32_t bindingCount, const VkBuffer *pBuffers,
+   const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (firstBinding != 0 || bindingCount != 1 || pBuffers == NULL) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   if (pBuffers[0] == VK_NULL_HANDLE) {
+      if (cmd->state.gfx.xfb_active) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+         return;
+      }
+      memset(&cmd->state.gfx.xfb[0], 0, sizeof(cmd->state.gfx.xfb[0]));
+      return;
+   }
+
+   VK_FROM_HANDLE(kk_buffer, buffer, pBuffers[0]);
+   const VkDeviceSize offset = pOffsets ? pOffsets[0] : 0;
+   const VkDeviceSize requested_size = pSizes ? pSizes[0] : VK_WHOLE_SIZE;
+   if (!(buffer->vk.usage & VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT) ||
+       offset > buffer->vk.size ||
+       (requested_size != VK_WHOLE_SIZE &&
+        (requested_size > buffer->vk.size - offset ||
+         requested_size > UINT64_MAX - offset))) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   const VkDeviceSize resolved_size =
+      vk_buffer_range(&buffer->vk, offset, requested_size);
+   if (resolved_size > UINT64_MAX - offset) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   const VkDeviceAddress address = vk_buffer_address(&buffer->vk, 0);
+   if (kk_xfb_bind_buffer(&cmd->state.gfx, 0, address,
+                          offset + resolved_size, offset, 0) != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+}
+
+static bool
+kk_xfb_counter_addresses_from_buffers(
+   uint32_t first_counter_buffer, uint32_t counter_buffer_count,
+   const VkBuffer *counter_buffers, const VkDeviceSize *counter_offsets,
+   VkDeviceAddress addresses[KK_XFB_BUFFER_COUNT])
+{
+   memset(addresses, 0, sizeof(VkDeviceAddress) * KK_XFB_BUFFER_COUNT);
+   if (first_counter_buffer != 0 || counter_buffer_count > 1 ||
+       (counter_buffer_count && counter_buffers == NULL))
+      return false;
+
+   for (uint32_t i = 0; i < counter_buffer_count; i++) {
+      const VkDeviceSize offset = counter_offsets ? counter_offsets[i] : 0;
+      if (!kk_xfb_counter_buffer_address(counter_buffers[i], offset,
+                                         &addresses[i]))
+         return false;
+   }
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginTransformFeedbackEXT(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
+   uint32_t counterBufferCount, const VkBuffer *pCounterBuffers,
+   const VkDeviceSize *pCounterBufferOffsets)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT];
+   if (!kk_xfb_counter_addresses_from_buffers(
+          firstCounterBuffer, counterBufferCount, pCounterBuffers,
+          pCounterBufferOffsets, counter_addresses)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   VkResult result = kk_xfb_begin(cmd, counter_addresses);
+   if (result != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmd->vk, result);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdEndTransformFeedbackEXT(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
+   uint32_t counterBufferCount, const VkBuffer *pCounterBuffers,
+   const VkDeviceSize *pCounterBufferOffsets)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT];
+   if (!kk_xfb_counter_addresses_from_buffers(
+          firstCounterBuffer, counterBufferCount, pCounterBuffers,
+          pCounterBufferOffsets, counter_addresses)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_VALIDATION_FAILED);
+      return;
+   }
+
+   VkResult result = kk_xfb_end(cmd, counter_addresses);
+   if (result != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmd->vk, result);
+}
+
+enum kk_xfb_queue_op_type {
+   KK_XFB_QUEUE_BIND,
+   KK_XFB_QUEUE_BEGIN,
+   KK_XFB_QUEUE_END,
+};
+
+struct kk_xfb_queue_op {
+   enum kk_xfb_queue_op_type type;
+   uint32_t binding;
+   struct kk_xfb_binding xfb_binding;
+   VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT];
+};
+
+static VkResult
+kk_xfb_apply_queue_op(struct kk_cmd_buffer *cmd,
+                      const struct kk_xfb_queue_op *op)
+{
+   switch (op->type) {
+   case KK_XFB_QUEUE_BIND:
+      return kk_xfb_bind_buffer(
+         &cmd->state.gfx, op->binding, op->xfb_binding.buffer_address,
+         op->xfb_binding.range, op->xfb_binding.binding_offset,
+         op->xfb_binding.current_offset);
+   case KK_XFB_QUEUE_BEGIN:
+      return kk_xfb_begin(cmd, op->counter_addresses);
+   case KK_XFB_QUEUE_END:
+      return kk_xfb_end(cmd, op->counter_addresses);
+   }
+
+   UNREACHABLE("invalid internal XFB queue operation");
+}
+
+static void
+kk_xfb_replay_queue_op(VkCommandBuffer commandBuffer, const void *data)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   const struct kk_xfb_queue_op *op = data;
+   VkResult result = kk_xfb_apply_queue_op(cmd, op);
+   if (result != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmd->vk, result);
+}
+
+static VkResult
+kk_xfb_record_queue_op(struct kk_cmd_buffer *cmd,
+                       const struct kk_xfb_queue_op *op)
+{
+   VkResult result = kk_xfb_apply_queue_op(cmd, op);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (!vk_cmd_queue_enqueue_custom(&cmd->vk.cmd_queue,
+                                   kk_xfb_replay_queue_op, op, sizeof(*op))) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   return VK_SUCCESS;
+}
+
+/* Private test hook for the future bind operation. */
+__attribute__((visibility("default"))) VkResult
+kk_test_set_xfb_capture_target(VkCommandBuffer commandBuffer,
+                               VkDeviceAddress buffer_address,
+                               VkDeviceSize range,
+                               VkDeviceSize binding_offset,
+                               VkDeviceSize current_offset)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   struct kk_xfb_queue_op op = {
+      .type = KK_XFB_QUEUE_BIND,
+      .binding = 0,
+   };
+   if (!kk_xfb_binding_configure(&op.xfb_binding, buffer_address, range,
+                                 binding_offset, current_offset))
+      return VK_ERROR_VALIDATION_FAILED;
+   return kk_xfb_record_queue_op(cmd, &op);
+}
+
+__attribute__((visibility("default"))) VkResult
+kk_test_begin_xfb(VkCommandBuffer commandBuffer,
+                  VkDeviceAddress counter_buffer_address,
+                  VkDeviceSize counter_buffer_offset)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       counter_buffer_offset > UINT64_MAX - counter_buffer_address ||
+       ((counter_buffer_address + counter_buffer_offset) & 3) != 0)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT] = {0};
+   if (counter_buffer_address)
+      counter_addresses[0] = counter_buffer_address + counter_buffer_offset;
+   struct kk_xfb_queue_op op = {.type = KK_XFB_QUEUE_BEGIN};
+   memcpy(op.counter_addresses, counter_addresses,
+          sizeof(op.counter_addresses));
+   return kk_xfb_record_queue_op(cmd, &op);
+}
+
+__attribute__((visibility("default"))) VkResult
+kk_test_end_xfb(VkCommandBuffer commandBuffer,
+                VkDeviceAddress counter_buffer_address,
+                VkDeviceSize counter_buffer_offset)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING ||
+       counter_buffer_offset > UINT64_MAX - counter_buffer_address ||
+       ((counter_buffer_address + counter_buffer_offset) & 3) != 0)
+      return VK_ERROR_VALIDATION_FAILED;
+
+   VkDeviceAddress counter_addresses[KK_XFB_BUFFER_COUNT] = {0};
+   if (counter_buffer_address)
+      counter_addresses[0] = counter_buffer_address + counter_buffer_offset;
+   struct kk_xfb_queue_op op = {.type = KK_XFB_QUEUE_END};
+   memcpy(op.counter_addresses, counter_addresses,
+          sizeof(op.counter_addresses));
+   return kk_xfb_record_queue_op(cmd, &op);
 }
 
 static void
@@ -2096,6 +2536,8 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
    draw.index.gpu.range = dev->heap->size_B - sizeof(struct poly_heap);
    draw.index.el_size_B = 4u;
    draw.primitive_type = mesa_prim_to_mtl_primitive_type(gfx->tess.prim);
+   draw.query_topology = kk_prim_to_vk_topology(gfx->tess.prim);
+   draw.query_restart = false;
    return draw;
 }
 
@@ -2156,6 +2598,9 @@ kk_launch_gs(struct kk_cmd_buffer *cmd, struct kk_draw_data draw,
                           0u);
    draw.vertex_offset = 0u;
    draw.primitive_type = mesa_prim_to_mtl_primitive_type(info.mode);
+   draw.query_topology = kk_prim_to_vk_topology(info.mode);
+   draw.query_restart = info.shape == POLY_GS_SHAPE_DYNAMIC_INDEXED;
+   draw.query_restart_index = UINT32_MAX;
 
    if (info.shape == POLY_GS_SHAPE_STATIC_INDEXED) {
       /* Not implemented. poly_nir_lower_gs()'s static-topology fallback
@@ -2274,6 +2719,9 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
       .primitive_type = (tess || gs)
                            ? 0u
                            : mesa_prim_to_mtl_primitive_type(data->prim),
+      .query_topology = kk_prim_to_vk_topology(data->prim),
+      .query_restart = data->restart,
+      .query_restart_index = data->restart_index,
    };
 
    if (data->indirect) {
@@ -2302,6 +2750,122 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
    return draw;
 }
 
+/* Match nir_lower_xfb_to_stores' record extent calculation for all outputs
+ * assigned to a buffer. NIR output offsets and component masks are the source
+ * of truth; advancement uses the full record extent, independently of stride.
+ */
+static bool
+kk_xfb_record_layout(const struct kk_shader_info *info, unsigned buffer,
+                     uint32_t *stride_out, uint32_t *extent_out)
+{
+   if (!info->has_xfb_capture_metadata || buffer >= MAX_XFB_BUFFERS)
+      return false;
+
+   const nir_xfb_info *xfb = &info->xfb_info;
+   uint32_t stride = xfb->buffers[buffer].stride;
+   uint32_t extent_words = 0;
+   if (stride == 0)
+      return false;
+
+   for (unsigned i = 0; i < xfb->output_count; i++) {
+      const nir_xfb_output_info *out = &info->xfb_outputs[i];
+      if (out->buffer != buffer || out->component_mask == 0)
+         continue;
+
+      const uint32_t offset_words = out->offset / 4;
+      if (offset_words < out->component_offset)
+         return false;
+
+      unsigned end_component = 0;
+      for (unsigned c = 0; c < 4; c++) {
+         if (out->component_mask & BITFIELD_BIT(c))
+            end_component = c + 1;
+      }
+      extent_words = MAX2(extent_words,
+                          offset_words - out->component_offset +
+                             end_component);
+   }
+
+   if (extent_words == 0)
+      return false;
+
+   *stride_out = stride;
+   *extent_out = extent_words * 4;
+   return true;
+}
+
+/* Schedule one GPU operation per draw: snapshot the execution-time counter
+ * for the VS, then advance the authoritative counter once for all complete
+ * triangles that fit. This avoids per-vertex races and keeps command-buffer
+ * replay independent of host-side counter contents.
+ */
+static bool
+kk_xfb_prepare_draw(struct kk_cmd_buffer *cmd,
+                    const struct kk_shader_info *shader_info,
+                    const struct kk_draw_data *draw)
+{
+   struct kk_xfb_binding *binding = &cmd->state.gfx.xfb[0];
+   uint32_t stride, record_extent;
+   if (!binding->valid ||
+       !kk_xfb_record_layout(shader_info, 0, &stride, &record_extent) ||
+       binding->binding_offset > binding->range ||
+       !cmd->state.gfx.xfb_runtime_state_addr)
+      return false;
+
+   const uint64_t usable_size = binding->range - binding->binding_offset;
+   libkk_xfb_counter_prepare_draw(
+      cmd, kk_grid_1d(1), false, cmd->state.gfx.xfb_runtime_state_addr,
+      usable_size, stride, record_extent, draw->grid.size.x,
+      cmd->state.gfx.xfb_query.active
+         ? cmd->state.gfx.xfb_query.report_addr
+         : 0);
+   return true;
+}
+
+static void
+kk_pg_query_add_draw(struct kk_cmd_buffer *cmd,
+                     const struct kk_draw_data *draw)
+{
+   const struct kk_primitives_generated_query_state *query =
+      &cmd->state.gfx.pg_query;
+   if (!query->active)
+      return;
+
+   uint64_t draw_addr;
+   if (kk_grid_is_indirect(draw->grid)) {
+      draw_addr = draw->grid.addr;
+   } else if (draw->index.el_size_B) {
+      VkDrawIndexedIndirectCommand indirect = {
+         .indexCount = draw->grid.size.x,
+         .instanceCount = draw->grid.size.y,
+         .firstIndex = 0,
+         .vertexOffset = draw->vertex_offset,
+         .firstInstance = draw->grid.size.z,
+      };
+      draw_addr = kk_pool_upload(cmd, &indirect, sizeof(indirect), 4u).gpu;
+   } else {
+      VkDrawIndirectCommand indirect = {
+         .vertexCount = draw->grid.size.x,
+         .instanceCount = draw->grid.size.y,
+         .firstVertex = draw->vertex_offset,
+         .firstInstance = draw->grid.size.z,
+      };
+      draw_addr = kk_pool_upload(cmd, &indirect, sizeof(indirect), 4u).gpu;
+   }
+
+   if (!draw_addr) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   libkk_primitives_generated_add(
+      cmd, kk_grid_1d(1), false, query->report_addr, draw_addr,
+      draw->index.gpu.addr, draw->index.gpu.range, draw->query_topology,
+      draw->index.el_size_B != 0, kk_grid_is_indirect(draw->grid),
+      draw->query_restart, draw->query_restart_index,
+      draw->index.el_size_B);
+}
+
 static void
 kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
@@ -2328,14 +2892,40 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    for (uint32_t i = 0; i < data->draw_count; i++) {
       struct kk_draw_data draw_data = build_draw_data(cmd, data, i);
 
-      if (data->upload_mask)
-         kk_upload_per_draw_data(cmd, data->upload_mask, i, &draw_data);
+      if (data->upload_mask) {
+         struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+         bool xfb_metadata_supported =
+            !vs->info.has_xfb_capture_metadata ||
+            (vs->info.xfb_info.buffers_written == BITFIELD_BIT(0) &&
+             vs->info.xfb_info.streams_written == BITFIELD_BIT(0) &&
+             vs->info.xfb_info.buffer_to_stream[0] == 0);
+         bool xfb_capture_supported =
+            cmd->state.gfx.xfb_active &&
+            cmd->state.gfx.xfb_runtime_state_addr != 0 &&
+            cmd->state.gfx.xfb[0].valid && !tess && !gs &&
+            data->prim == MESA_PRIM_TRIANGLES &&
+            !data->indexed && !data->indirect && !data->restart &&
+            data->draw_count == 1 && draw_data.grid.size.y == 1 &&
+            draw_data.grid.size.z == 0 && draw_data.grid.size.x % 3 == 0 &&
+            xfb_metadata_supported;
+         if (xfb_capture_supported)
+            xfb_capture_supported =
+               kk_xfb_prepare_draw(cmd, &vs->info, &draw_data);
+         kk_upload_per_draw_data(cmd, data->upload_mask, i, &draw_data,
+                                 xfb_capture_supported);
+      }
 
       if (tess)
          draw_data = kk_launch_tess(cmd, draw_data);
       else if (gs)
          draw_data = kk_launch_gs(cmd, draw_data, data->prim,
                                   data->flatshade_first);
+
+      /* PGQ counts the final primitive stream independently of transform
+       * feedback writes/capacity. Run after KK's optional tessellation/GS
+       * expansion so the descriptor and index stream describe generated
+       * output, and before raster dispatch. */
+      kk_pg_query_add_draw(cmd, &draw_data);
 
       /* TODO_KOSMICKRISP Remove this once unroll, tess and any compute does not
        * split render pass */

@@ -5830,6 +5830,17 @@ typedef struct {
     * for drivers that rasterize and capture in the same draw.
     */
    bool keep_outputs;
+   /* Guard each captured vertex record against the bound XFB range. The
+    * driver must lower load_xfb_size() after this pass. When enabled, stores
+    * for a buffer are emitted only if the complete record fits.
+    */
+   bool bounds_check;
+   /* Optional whole-primitive bounds mode. Zero keeps the per-record check;
+    * otherwise this is the number of vertices in a primitive, and every
+    * record belonging to that primitive is emitted only if the full
+    * primitive's records fit. The caller must guarantee the topology matches.
+    */
+   uint8_t vertices_per_primitive;
 } nir_lower_xfb_to_stores_options;
 
 bool nir_lower_xfb_to_stores(nir_shader *nir, const nir_lower_xfb_to_stores_options *options);

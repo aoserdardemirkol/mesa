@@ -10,6 +10,7 @@
 #include "kk_descriptor_set.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_shader.h"
+#include "kk_xfb_abi.h"
 
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
@@ -874,8 +875,9 @@ bool
 kk_nir_lower_poly(struct nir_shader *nir)
 {
    bool is_compute = nir->info.stage == MESA_SHADER_COMPUTE;
-   return nir_shader_intrinsics_pass(nir, lower_poly, nir_metadata_control_flow,
-                                     &is_compute);
+   bool progress = nir_shader_intrinsics_pass(
+      nir, lower_poly, nir_metadata_control_flow, &is_compute);
+   return kk_nir_lower_xfb_sysvals(nir) || progress;
 }
 
 static bool

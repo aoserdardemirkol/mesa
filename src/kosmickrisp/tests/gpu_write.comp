@@ -1,0 +1,13 @@
+#version 450
+
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Output {
+   uint words[];
+} output_buffer;
+
+void main()
+{
+   output_buffer.words[4] = 0x11223344u;
+   output_buffer.words[8] = 0x55667788u;
+   output_buffer.words[12] = 0x99aabbccu;
+}

@@ -13,6 +13,7 @@
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
+#include "nir_xfb_info.h"
 #include "poly/nir/poly_nir.h"
 
 #include "vk_pipeline_cache.h"
@@ -26,6 +27,8 @@ struct kk_cmd_buffer;
  * hardware vertex-function variant instead (see poly_nir_lower_gs()).
  */
 #define KK_GS_MAIN_SLOT MESA_SHADER_STAGES
+
+#define KK_MAX_XFB_OUTPUTS 64
 
 struct kk_tess_info {
    enum tess_primitive_mode mode : 8;
@@ -124,7 +127,34 @@ struct kk_shader_info {
          enum mesa_prim output_primitive;
       } gs;
    };
+
+   /* NIR's XFB info has a flexible output array. Store a fixed-size copy in
+    * shader-info so metadata outlives NIR and is covered by shader binaries.
+    */
+   bool has_xfb_capture_metadata;
+   uint8_t xfb_stride[MAX_XFB_BUFFERS];
+   nir_xfb_info xfb_info;
+   nir_xfb_output_info xfb_outputs[KK_MAX_XFB_OUTPUTS];
 };
+
+static_assert(offsetof(struct kk_shader_info, xfb_outputs) ==
+                 offsetof(struct kk_shader_info, xfb_info) +
+                    sizeof(nir_xfb_info),
+              "XFB output storage must follow its NIR metadata header");
+
+static inline bool
+kk_shader_info_copy_xfb(struct kk_shader_info *info, const nir_shader *nir)
+{
+   const nir_xfb_info *xfb = nir->xfb_info;
+   if (xfb == NULL)
+      return false;
+
+   assert(xfb->output_count <= KK_MAX_XFB_OUTPUTS);
+   info->has_xfb_capture_metadata = true;
+   memcpy(&info->xfb_info, xfb, nir_xfb_info_size(xfb->output_count));
+   memcpy(info->xfb_stride, nir->info.xfb_stride, sizeof(info->xfb_stride));
+   return true;
+}
 
 /* Metal handles for binding. */
 struct kk_pipeline_handles {
@@ -158,6 +188,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
+
+void kk_shader_destroy(struct vk_device *dev, struct kk_shader *shader,
+                       const VkAllocationCallbacks *alloc);
 
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
