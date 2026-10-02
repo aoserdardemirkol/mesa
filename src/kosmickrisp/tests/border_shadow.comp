@@ -1,0 +1,19 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DShadow shadow_map;
+layout(set = 0, binding = 1, std430) readonly buffer Cases {
+   vec4 cases[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer Results {
+   float results[];
+};
+
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   vec4 c = cases[i];
+   /* c.xy is the coordinate and c.z the reference depth. */
+   results[i] = textureLod(shadow_map, vec3(c.xy, c.z), 0.0);
+}
